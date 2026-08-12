@@ -136,6 +136,8 @@ const organizationUserSchema = z.object({ username: z.string().min(3).max(60), e
 const projectAccessSchema = z.object({ canView: z.boolean().default(true), canReport: z.boolean().default(true), canComment: z.boolean().default(true), canManage: z.boolean().default(false) });
 const reportSchema = z.object({ projectId: z.string().uuid(), title: z.string().min(4).max(240), description: z.string().min(4).max(20000), reproductionSteps: z.string().max(20000).optional(), expectedResult: z.string().max(20000).optional(), actualResult: z.string().max(20000).optional(), browserDevice: z.string().max(500).optional(), applicationVersion: z.string().max(200).optional(), priority: z.enum(['low', 'medium', 'high', 'critical']).default('medium'), dueAt: z.string().datetime().optional() });
 const commentSchema = z.object({ body: z.string().min(1).max(20000), visibility: z.enum(['customer', 'internal']).default('customer') });
+const passwordResetRequestSchema = z.object({ email: z.string().email() });
+const passwordResetConfirmSchema = z.object({ token: z.string().min(20), password: z.string().min(12).max(200) });
 
 app.get('/api/health', (_request, response) => {
   response.json({ status: 'ok', service: 'bugflow', storageConfigured: storageIsConfigured(), timestamp: new Date().toISOString() });
@@ -170,6 +172,36 @@ app.post('/api/auth/logout', async (request: AppRequest, response) => {
   if (token) await query('DELETE FROM sessions WHERE token_hash = $1', [hashToken(token)]);
   response.setHeader('Set-Cookie', 'bugflow_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0');
   response.status(204).end();
+});
+
+
+
+app.post('/api/auth/password-reset/request', async (request: Request, response: Response) => {
+  const parsed = passwordResetRequestSchema.safeParse(request.body);
+  if (!parsed.success) return response.status(400).json({ error: 'Provide a valid email address.' });
+  try {
+    const account = await query<{ id: string; email: string; display_name: string }>('SELECT id, email, display_name FROM users WHERE email = $1 AND is_active = true AND deleted_at IS NULL', [parsed.data.email]);
+    if (!account.rowCount) return response.status(202).json({ accepted: true });
+    const token = randomBytes(32).toString('base64url');
+    await query("INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, now() + interval '1 hour')", [account.rows[0].id, hashToken(token)]);
+    const appUrl = process.env.APP_URL || request.protocol + '://' + request.get('host');
+    const resetUrl = appUrl + '/?reset=' + encodeURIComponent(token);
+    await sendBugFlowEmail({ to: account.rows[0].email, subject: 'Reset your BugFlow password', html: '<div style="font-family:Inter,Arial,sans-serif;color:#24242a;line-height:1.5"><p style="color:#6b61dd;font-weight:700">BugFlow</p><h2>Reset your password</h2><p>Hello ' + account.rows[0].display_name + ', use the secure link below within one hour.</p><p><a href="' + resetUrl + '" style="display:inline-block;background:#6257dc;color:#fff;padding:10px 16px;border-radius:8px;text-decoration:none">Reset password</a></p><p style="color:#666;font-size:12px">If you did not request this change, you can ignore this email.</p></div>' });
+    await writeAuditEvent({ actorId: account.rows[0].id, entityType: 'authentication', action: 'password_reset_requested', ipAddress: clientIp(request) });
+    return response.status(202).json({ accepted: true });
+  } catch (error) { return response.status(503).json({ error: 'Password reset email delivery is not configured. Contact your administrator.' }); }
+});
+
+app.post('/api/auth/password-reset/confirm', async (request: Request, response: Response) => {
+  const parsed = passwordResetConfirmSchema.safeParse(request.body);
+  if (!parsed.success) return response.status(400).json({ error: 'Provide a valid reset token and a password of at least 12 characters.' });
+  try {
+    const reset = await query<{ id: string; user_id: string }>('SELECT id, user_id FROM password_reset_tokens WHERE token_hash = $1 AND expires_at > now() AND used_at IS NULL', [hashToken(parsed.data.token)]);
+    if (!reset.rowCount) return response.status(400).json({ error: 'This password-reset link is invalid or has expired.' });
+    await withTransaction(async (client) => { await client.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hashPassword(parsed.data.password), reset.rows[0].user_id]); await client.query('UPDATE password_reset_tokens SET used_at = now() WHERE id = $1', [reset.rows[0].id]); await client.query('DELETE FROM sessions WHERE user_id = $1', [reset.rows[0].user_id]); });
+    await writeAuditEvent({ actorId: reset.rows[0].user_id, entityType: 'authentication', action: 'password_reset_completed', ipAddress: clientIp(request) });
+    return response.status(204).end();
+  } catch (error) { return response.status(503).json({ error: 'Password reset is temporarily unavailable.' }); }
 });
 
 app.get('/api/auth/session', async (request: AppRequest, response) => {
