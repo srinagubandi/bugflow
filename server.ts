@@ -178,10 +178,10 @@ app.get('/api/auth/session', async (request: AppRequest, response) => {
 
   const organizations = await query<{ id: string; name: string; slug: string; role: string }>(
     actor.isPlatformAdmin
-      ? `SELECT o.id, o.name, o.slug, 'platform_admin' AS role FROM organizations o WHERE o.is_active = true AND o.deleted_at IS NULL ORDER BY o.name`
+      ? `SELECT o.id, o.name, o.slug, 'platform_admin' AS role FROM organizations o WHERE o.deleted_at IS NULL ORDER BY o.name`
       : `SELECT o.id, o.name, o.slug, m.role
          FROM memberships m JOIN organizations o ON o.id = m.organization_id
-         WHERE m.user_id = $1 AND m.is_active = true AND o.is_active = true AND o.deleted_at IS NULL
+         WHERE m.user_id = $1 AND m.is_active = true AND o.deleted_at IS NULL
          ORDER BY o.name`,
     actor.isPlatformAdmin ? [] : [actor.id],
   );
