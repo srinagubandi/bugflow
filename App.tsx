@@ -1,353 +1,121 @@
-import { FormEvent, type ReactElement, type ReactNode, useMemo, useState } from 'react';
+import { type FormEvent, type ReactElement, useEffect, useMemo, useState } from 'react';
 
-type Status = 'New' | 'Acknowledged' | 'In Progress' | 'Resolved' | 'Closed';
-type Priority = 'Critical' | 'High' | 'Medium' | 'Low';
-type View = 'Dashboard' | 'Issues' | 'Projects' | 'Activity';
+type Status = 'new' | 'acknowledged' | 'in_progress' | 'resolved' | 'closed';
+type Priority = 'low' | 'medium' | 'high' | 'critical';
+type View = 'Dashboard' | 'Reports' | 'Projects';
 
-type Issue = {
-  id: string;
-  title: string;
-  project: string;
-  status: Status;
-  priority: Priority;
-  labels: string[];
-  assignee: string;
-  reporter: string;
-  updated: string;
-  comments: number;
-  due: string;
-  description: string;
+type User = { id: string; username: string; email: string; displayName: string; isPlatformAdmin: boolean };
+type Organization = { id: string; name: string; slug: string; role: string };
+type Project = { id: string; name: string; slug: string; description?: string | null; color: string; openReportCount: number };
+type Report = {
+  id: string; sequenceNumber: number; title: string; status: Status; priority: Priority; updatedAt: string; dueAt?: string | null;
+  projectId: string; projectName: string; reporterName: string; assigneeName?: string | null; labels: string[];
 };
+type Session = { user: User; organizations: Organization[] };
 
-const issuesSeed: Issue[] = [
-  {
-    id: 'BF-184',
-    title: 'iOS client stops syncing after the app returns from background',
-    project: 'Pulse Mobile',
-    status: 'In Progress',
-    priority: 'Critical',
-    labels: ['Mobile', 'Sync'],
-    assignee: 'Maya Patel',
-    reporter: 'Northstar Health',
-    updated: '8m ago',
-    comments: 8,
-    due: 'Today',
-    description: 'Returning to the foreground leaves the event queue disconnected until the customer force-quits the app.',
-  },
-  {
-    id: 'BF-177',
-    title: 'Exported CSV omits records filtered by multiple labels',
-    project: 'Reporting',
-    status: 'Acknowledged',
-    priority: 'High',
-    labels: ['API', 'Reporting'],
-    assignee: 'Jordan Lee',
-    reporter: 'Axiom Labs',
-    updated: '22m ago',
-    comments: 3,
-    due: 'Tomorrow',
-    description: 'The export endpoint accepts the filter but only respects the first selected label.',
-  },
-  {
-    id: 'BF-172',
-    title: 'New team members cannot open shared saved views',
-    project: 'Workspace',
-    status: 'New',
-    priority: 'Medium',
-    labels: ['Permissions'],
-    assignee: 'Unassigned',
-    reporter: 'Orbit Studios',
-    updated: '1h ago',
-    comments: 1,
-    due: 'Fri, Aug 16',
-    description: 'Members receive an access error when opening a saved view shared by an organization admin.',
-  },
-  {
-    id: 'BF-169',
-    title: 'Screenshot annotations shift when viewed on high-density displays',
-    project: 'Console',
-    status: 'Resolved',
-    priority: 'Medium',
-    labels: ['UI'],
-    assignee: 'Ana Rivera',
-    reporter: 'Kite & Co.',
-    updated: '2h ago',
-    comments: 5,
-    due: 'Completed',
-    description: 'Annotation coordinates were calculated from the rendered image width rather than its intrinsic size.',
-  },
-  {
-    id: 'BF-162',
-    title: 'Project digest links open the incorrect organization workspace',
-    project: 'Notifications',
-    status: 'New',
-    priority: 'Low',
-    labels: ['Email'],
-    assignee: 'Maya Patel',
-    reporter: 'Summit Partners',
-    updated: 'Yesterday',
-    comments: 2,
-    due: 'Mon, Aug 19',
-    description: 'Digest links retain the sender organization rather than the recipient’s selected organization.',
-  },
-];
+const statusOrder: Status[] = ['new', 'acknowledged', 'in_progress', 'resolved', 'closed'];
+const priorityOrder: Priority[] = ['low', 'medium', 'high', 'critical'];
+const statusLabel = (value: Status) => ({ new: 'New', acknowledged: 'Acknowledged', in_progress: 'In progress', resolved: 'Resolved', closed: 'Closed' })[value];
+const priorityLabel = (value: Priority) => value[0].toUpperCase() + value.slice(1);
+const reportCode = (report: Report) => `BF-${report.sequenceNumber}`;
 
-const projects = [
-  { name: 'Pulse Mobile', color: '#8176ff', count: 18, trend: '+4 this week' },
-  { name: 'Workspace', color: '#4dd4a9', count: 11, trend: '+1 this week' },
-  { name: 'Reporting', color: '#ef9d54', count: 7, trend: '−2 this week' },
-  { name: 'Console', color: '#ec6e8f', count: 5, trend: 'Stable' },
-];
+async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const response = await fetch(path, {
+    ...options,
+    credentials: 'include',
+    headers: { ...(options.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }), ...(options.headers ?? {}) },
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({ error: 'Unable to complete this request.' }));
+    throw new Error(body.error ?? 'Unable to complete this request.');
+  }
+  if (response.status === 204) return undefined as T;
+  return response.json() as Promise<T>;
+}
 
-const statusOrder: Status[] = ['New', 'Acknowledged', 'In Progress', 'Resolved', 'Closed'];
-const priorityOrder: Priority[] = ['Critical', 'High', 'Medium', 'Low'];
-
-function Icon({ name, size = 16 }: { name: string; size?: number }) {
+function Icon({ name }: { name: 'grid' | 'bug' | 'folder' | 'plus' | 'arrow' | 'close' | 'search' | 'pulse' | 'lock' | 'user' | 'logout' }) {
   const paths: Record<string, ReactElement> = {
     grid: <><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></>,
     bug: <><path d="M9 9h6v6H9z"/><path d="M12 9V6m0 12v-3M9 11H5m4 3H5m10-3h4m-4 3h4M8 7 6 5m10 2 2-2M8 17l-2 2m10-2 2 2"/></>,
-    folder: <><path d="M3 6.5A2.5 2.5 0 0 1 5.5 4H10l2 2h6.5A2.5 2.5 0 0 1 21 8.5v8A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z"/></>,
-    pulse: <path d="M3 12h4l2-6 4 12 2-6h6"/>,
-    search: <><circle cx="10.8" cy="10.8" r="6.3"/><path d="m16 16 4.2 4.2"/></>,
-    plus: <path d="M12 5v14M5 12h14"/>,
-    bell: <><path d="M18 9a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M10 21h4"/></>,
-    chevron: <path d="m8 10 4 4 4-4"/>,
-    arrow: <path d="M5 12h14m-6-6 6 6-6 6"/>,
-    dots: <><circle cx="5" cy="12" r="1" fill="currentColor"/><circle cx="12" cy="12" r="1" fill="currentColor"/><circle cx="19" cy="12" r="1" fill="currentColor"/></>,
-    filter: <path d="M4 6h16M7 12h10m-7 6h4"/>,
-    comment: <path d="M20 15a4 4 0 0 1-4 4H8l-4 3v-7a4 4 0 0 1-1-3V8a4 4 0 0 1 4-4h9a4 4 0 0 1 4 4z"/>,
-    close: <path d="m6 6 12 12M18 6 6 18"/>,
-    calendar: <><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M8 3v4m8-4v4M3 10h18"/></>,
-    check: <path d="m5 12 4 4L19 6"/>,
+    folder: <path d="M3 7a3 3 0 0 1 3-3h4l2 2h6a3 3 0 0 1 3 3v7a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3z"/>,
+    plus: <path d="M12 5v14M5 12h14"/>, arrow: <path d="M5 12h14m-6-6 6 6-6 6"/>, close: <path d="m6 6 12 12M18 6 6 18"/>,
+    search: <><circle cx="10.8" cy="10.8" r="6.3"/><path d="m16 16 4.2 4.2"/></>, pulse: <path d="M3 12h4l2-6 4 12 2-6h6"/>,
     lock: <><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></>,
+    user: <><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></>, logout: <><path d="M10 5H5v14h5"/><path d="m14 8 4 4-4 4m4-4H9"/></>,
   };
-  return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name] ?? paths.grid}</svg>;
-}
-
-function statusClass(status: Status) {
-  return `status status-${status.toLowerCase().replaceAll(' ', '-')}`;
-}
-
-function priorityClass(priority: Priority) {
-  return `priority priority-${priority.toLowerCase()}`;
-}
-
-function Avatar({ name, small = false }: { name: string; small?: boolean }) {
-  const initial = name === 'Unassigned' ? '—' : name.split(' ').map((part) => part[0]).join('').slice(0, 2);
-  const tone = name === 'Maya Patel' ? 'violet' : name === 'Jordan Lee' ? 'peach' : name === 'Ana Rivera' ? 'mint' : 'slate';
-  return <span className={`avatar ${tone} ${small ? 'avatar-small' : ''}`} title={name}>{initial}</span>;
+  return <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
 }
 
 export default function App() {
-  const [view, setView] = useState<View>('Dashboard');
-  const [issues, setIssues] = useState<Issue[]>(issuesSeed);
-  const [selected, setSelected] = useState<Issue | null>(null);
-  const [showCreate, setShowCreate] = useState(false);
-  const [query, setQuery] = useState('');
-  const [statusFilter, setStatusFilter] = useState<Status | 'All'>('All');
-  const [toast, setToast] = useState('');
-  const [profileMenu, setProfileMenu] = useState(false);
+  const [session, setSession] = useState<Session | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [authError, setAuthError] = useState('');
 
-  const visibleIssues = useMemo(() => issues.filter((issue) => {
-    const needle = query.toLowerCase();
-    const matchesQuery = !needle || [issue.id, issue.title, issue.project, issue.assignee, issue.labels.join(' ')].join(' ').toLowerCase().includes(needle);
-    const matchesStatus = statusFilter === 'All' || issue.status === statusFilter;
-    return matchesQuery && matchesStatus;
-  }), [issues, query, statusFilter]);
-
-  const openCount = issues.filter((issue) => !['Resolved', 'Closed'].includes(issue.status)).length;
-  const dueSoon = issues.filter((issue) => issue.due === 'Today' || issue.due === 'Tomorrow').length;
-  const critical = issues.filter((issue) => issue.priority === 'Critical' && !['Resolved', 'Closed'].includes(issue.status)).length;
-
-  const notify = (message: string) => {
-    setToast(message);
-    window.setTimeout(() => setToast(''), 2600);
+  const refreshSession = async () => {
+    const current = await api<Session>('/api/auth/session');
+    setSession(current);
+    return current;
   };
 
-  const createIssue = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
+  useEffect(() => {
+    api<Session>('/api/auth/session').then(setSession).catch(() => setSession(null)).finally(() => setLoading(false));
+  }, []);
+
+  if (loading) return <div className="boot-screen"><div className="brand-mark"><span></span><span></span><span></span></div><strong>Loading BugFlow</strong><small>Preparing your workspace…</small></div>;
+  if (!session) return <LoginScreen error={authError} onLogin={async (identifier, password) => { setAuthError(''); try { await api('/api/auth/login', { method: 'POST', body: JSON.stringify({ identifier, password }) }); await refreshSession(); } catch (error) { setAuthError(error instanceof Error ? error.message : 'Unable to sign in.'); } }} />;
+  if (session.user.isPlatformAdmin && session.organizations.length === 0) return <OrganizationOnboarding onCreated={refreshSession} user={session.user} />;
+  return <Workspace session={session} refreshSession={refreshSession} onLogout={async () => { await api('/api/auth/logout', { method: 'POST' }); setSession(null); }} />;
+}
+
+function LoginScreen({ onLogin, error }: { onLogin: (identifier: string, password: string) => Promise<void>; error: string }) {
+  const [busy, setBusy] = useState(false);
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault(); setBusy(true);
     const form = new FormData(event.currentTarget);
-    const newIssue: Issue = {
-      id: `BF-${Math.floor(185 + Math.random() * 80)}`,
-      title: String(form.get('title') || 'Untitled report'),
-      project: String(form.get('project') || 'Workspace'),
-      status: 'New',
-      priority: String(form.get('priority') || 'Medium') as Priority,
-      labels: ['Needs triage'],
-      assignee: 'Unassigned',
-      reporter: 'Your organization',
-      updated: 'Just now',
-      comments: 0,
-      due: 'Not set',
-      description: String(form.get('description') || 'No details provided.'),
-    };
-    setIssues((current) => [newIssue, ...current]);
-    setShowCreate(false);
-    setView('Issues');
-    notify(`${newIssue.id} was created and added to triage.`);
+    await onLogin(String(form.get('identifier') ?? ''), String(form.get('password') ?? ''));
+    setBusy(false);
   };
+  return <main className="auth-shell"><section className="auth-art"><div className="brand-row"><div className="brand-mark"><span></span><span></span><span></span></div><strong>BugFlow</strong></div><div><p className="eyebrow">Customer-informed product work</p><h1>Every report, <em>clearer.</em></h1><p>Bring your customers, product teams, and incident evidence into one governed workspace.</p></div><div className="auth-points"><span><i></i> Project-level customer access</span><span><i></i> Private evidence attachments</span><span><i></i> Audited status communications</span></div></section><section className="auth-panel"><form className="auth-card" onSubmit={submit}><div><p className="eyebrow">Secure sign in</p><h2>Welcome back</h2><p className="subtle">Use the username or email created by your administrator.</p></div>{error ? <p className="form-error">{error}</p> : null}<label>Username or email<input required name="identifier" autoComplete="username" placeholder="name@company.com" /></label><label>Password<input required minLength={8} name="password" type="password" autoComplete="current-password" placeholder="Your password" /></label><button className="send-button auth-submit" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'} <Icon name="arrow" /></button><p className="auth-footnote">Need access? Ask your organization administrator to create your account.</p></form></section></main>;
+}
 
-  const moveIssue = (issue: Issue, status: Status) => {
-    setIssues((current) => current.map((entry) => entry.id === issue.id ? { ...entry, status, updated: 'Just now' } : entry));
-    setSelected((current) => current ? { ...current, status, updated: 'Just now' } : current);
-    notify(`${issue.id} moved to ${status}.`);
+function OrganizationOnboarding({ user, onCreated }: { user: User; onCreated: () => Promise<unknown> }) {
+  const [error, setError] = useState(''); const [busy, setBusy] = useState(false);
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault(); setBusy(true); setError(''); const form = new FormData(event.currentTarget);
+    const name = String(form.get('name') ?? ''); const slug = String(form.get('slug') ?? '').toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    try { await api('/api/platform/organizations', { method: 'POST', body: JSON.stringify({ name, slug, admin: { username: String(form.get('adminUsername')), email: String(form.get('adminEmail')), displayName: String(form.get('adminName')), password: String(form.get('adminPassword')) } }) }); await onCreated(); } catch (err) { setError(err instanceof Error ? err.message : 'Unable to create organization.'); } finally { setBusy(false); }
   };
-
-  const navItems: { label: View; icon: string; badge?: number }[] = [
-    { label: 'Dashboard', icon: 'grid' },
-    { label: 'Issues', icon: 'bug', badge: openCount },
-    { label: 'Projects', icon: 'folder' },
-    { label: 'Activity', icon: 'pulse' },
-  ];
-
-  return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand-row">
-          <div className="brand-mark"><span></span><span></span><span></span></div>
-          <span>BugFlow</span>
-          <button className="icon-button sidebar-collapse" aria-label="Collapse navigation"><Icon name="chevron" size={14} /></button>
-        </div>
-
-        <button className="organization-switcher" onClick={() => notify('Organization switcher is ready for your connected organizations.')}>
-          <span className="org-logo">N</span>
-          <span className="organization-copy"><strong>Northstar</strong><small>Product operations</small></span>
-          <Icon name="chevron" size={14} />
-        </button>
-
-        <nav className="primary-nav" aria-label="Workspace navigation">
-          {navItems.map((item) => (
-            <button key={item.label} className={`nav-item ${view === item.label ? 'active' : ''}`} onClick={() => setView(item.label)}>
-              <Icon name={item.icon} size={17} />
-              <span>{item.label}</span>
-              {item.badge ? <span className="nav-badge">{item.badge}</span> : null}
-            </button>
-          ))}
-        </nav>
-
-        <div className="nav-section">
-          <div className="section-title"><span>Projects</span><button onClick={() => notify('Create a project from the Projects view.')} aria-label="Create project"><Icon name="plus" size={14} /></button></div>
-          {projects.map((project) => (
-            <button className="project-nav" key={project.name} onClick={() => { setView('Issues'); setQuery(project.name); }}>
-              <i style={{ background: project.color }}></i><span>{project.name}</span><em>{project.count}</em>
-            </button>
-          ))}
-        </div>
-
-        <div className="sidebar-footer">
-          <button className="help-link" onClick={() => notify('Help center link copied to your workspace menu.')}><span className="help-dot">?</span> Help & resources</button>
-          <button className="user-chip" onClick={() => setProfileMenu((current) => !current)}>
-            <Avatar name="Maya Patel" />
-            <span><strong>Maya Patel</strong><small>Organization admin</small></span>
-            <Icon name="dots" size={17} />
-          </button>
-          {profileMenu ? <div className="profile-menu"><button onClick={() => notify('Account settings would open here.')}>Account settings</button><button onClick={() => notify('You are already in Northstar.')}>Switch organization</button></div> : null}
-        </div>
-      </aside>
-
-      <main className="workspace">
-        <header className="topbar">
-          <button className="mobile-menu"><Icon name="grid" /></button>
-          <label className="search-box">
-            <Icon name="search" size={16} />
-            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search bugs, projects, people…" />
-            <kbd>⌘ K</kbd>
-          </label>
-          <div className="top-actions">
-            <button className="icon-button" onClick={() => notify('You have 3 unread notifications.')} aria-label="Notifications"><Icon name="bell" size={18} /><i className="notification-dot"></i></button>
-            <button className="new-report" onClick={() => setShowCreate(true)}><Icon name="plus" size={16} /> New report</button>
-          </div>
-        </header>
-
-        {view === 'Dashboard' && <Dashboard issues={issues} openCount={openCount} critical={critical} dueSoon={dueSoon} onSelect={setSelected} onViewIssues={() => setView('Issues')} />}
-        {view === 'Issues' && <IssuesView issues={visibleIssues} statusFilter={statusFilter} onStatusFilter={setStatusFilter} onSelect={setSelected} onCreate={() => setShowCreate(true)} />}
-        {view === 'Projects' && <ProjectsView onProject={(name) => { setView('Issues'); setQuery(name); }} />}
-        {view === 'Activity' && <ActivityView />}
-      </main>
-
-      {selected ? <IssueDrawer issue={selected} onClose={() => setSelected(null)} onMove={moveIssue} onNotify={notify} /> : null}
-      {showCreate ? <CreateReportModal onClose={() => setShowCreate(false)} onCreate={createIssue} /> : null}
-      {toast ? <div className="toast"><Icon name="check" size={16} /> {toast}</div> : null}
-    </div>
-  );
+  return <main className="setup-shell"><section className="setup-card"><div className="brand-row"><div className="brand-mark"><span></span><span></span><span></span></div><strong>BugFlow</strong></div><p className="eyebrow">Platform setup</p><h1>Create your first organization</h1><p className="subtle">You are signed in as the platform administrator, {user.displayName}. Create an organization and its first organization administrator.</p><form onSubmit={submit}>{error ? <p className="form-error">{error}</p> : null}<div className="form-two"><label>Organization name<input required name="name" placeholder="Northstar" /></label><label>Workspace slug<input required name="slug" pattern="[a-z0-9-]+" placeholder="northstar" /></label></div><div className="setup-divider">First organization admin</div><div className="form-two"><label>Full name<input required name="adminName" placeholder="Maya Patel" /></label><label>Username<input required name="adminUsername" minLength={3} placeholder="maya" /></label></div><div className="form-two"><label>Email<input required type="email" name="adminEmail" placeholder="maya@northstar.com" /></label><label>Temporary password<input required type="password" minLength={12} name="adminPassword" placeholder="At least 12 characters" /></label></div><button className="send-button auth-submit" disabled={busy}>{busy ? 'Creating workspace…' : 'Create organization'} <Icon name="arrow" /></button></form></section></main>;
 }
 
-function Dashboard({ issues, openCount, critical, dueSoon, onSelect, onViewIssues }: { issues: Issue[]; openCount: number; critical: number; dueSoon: number; onSelect: (issue: Issue) => void; onViewIssues: () => void }) {
-  const inProgress = issues.filter((issue) => issue.status === 'In Progress').length;
-  const recentlyUpdated = issues.slice(0, 4);
-  return <div className="page dashboard-page">
-    <div className="page-intro">
-      <div><p className="eyebrow">Tuesday, August 12</p><h1>Good morning, Maya</h1><p className="subtle">Here’s the current signal across Northstar’s product work.</p></div>
-      <button className="text-button" onClick={onViewIssues}>View all issues <Icon name="arrow" size={15} /></button>
-    </div>
-
-    <section className="metric-grid">
-      <MetricCard label="Open reports" value={String(openCount)} detail="Across 4 active projects" tone="violet" icon="bug" />
-      <MetricCard label="Needs attention" value={String(critical)} detail="Critical priority" tone="rose" icon="bell" />
-      <MetricCard label="Due soon" value={String(dueSoon)} detail="Within the next 24 hours" tone="gold" icon="calendar" />
-      <MetricCard label="In progress" value={String(inProgress)} detail="Assigned to your team" tone="mint" icon="pulse" />
-    </section>
-
-    <section className="dashboard-grid">
-      <div className="panel trend-panel">
-        <div className="panel-heading"><div><span className="panel-kicker">Report volume</span><h2>Issue flow</h2></div><button className="period-pill">Last 14 days <Icon name="chevron" size={14} /></button></div>
-        <div className="chart-summary"><strong>42</strong><span>reports created</span><span className="positive">+18.2%</span></div>
-        <div className="line-chart" aria-label="Issue flow chart"><svg viewBox="0 0 620 180" preserveAspectRatio="none"><defs><linearGradient id="area" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stopColor="#8278ff" stopOpacity=".32"/><stop offset="1" stopColor="#8278ff" stopOpacity="0"/></linearGradient></defs><path className="chart-area" d="M0,144 C42,135 54,102 92,117 C130,132 147,80 185,91 C220,102 241,118 278,92 C318,63 329,100 366,77 C402,55 426,68 461,42 C492,20 531,78 558,48 C586,18 598,32 620,15 L620,180 L0,180 Z"/><path className="chart-line" d="M0,144 C42,135 54,102 92,117 C130,132 147,80 185,91 C220,102 241,118 278,92 C318,63 329,100 366,77 C402,55 426,68 461,42 C492,20 531,78 558,48 C586,18 598,32 620,15"/><circle cx="461" cy="42" r="4" className="chart-dot"/></svg><div className="chart-axis"><span>Jul 30</span><span>Aug 2</span><span>Aug 5</span><span>Aug 8</span><span>Today</span></div></div>
-      </div>
-      <div className="panel distribution-panel">
-        <div className="panel-heading"><div><span className="panel-kicker">At a glance</span><h2>By status</h2></div><button className="icon-button muted"><Icon name="dots" size={17} /></button></div>
-        <div className="donut-layout"><div className="donut"><div><strong>{openCount}</strong><span>open</span></div></div><div className="status-list"><StatusRow color="#7e75ff" label="New" value={issues.filter((i) => i.status === 'New').length} /><StatusRow color="#e9b45d" label="Acknowledged" value={issues.filter((i) => i.status === 'Acknowledged').length} /><StatusRow color="#46c9a1" label="In progress" value={issues.filter((i) => i.status === 'In Progress').length} /><StatusRow color="#7790ab" label="Resolved" value={issues.filter((i) => i.status === 'Resolved').length} /></div></div>
-      </div>
-    </section>
-
-    <section className="dashboard-grid lower-grid">
-      <div className="panel reports-panel"><div className="panel-heading"><div><span className="panel-kicker">Triage queue</span><h2>Recently updated</h2></div><button className="text-button compact" onClick={onViewIssues}>See queue <Icon name="arrow" size={14} /></button></div><div className="issue-list compact-list">{recentlyUpdated.map((issue) => <IssueRow issue={issue} key={issue.id} onSelect={onSelect} />)}</div></div>
-      <div className="panel project-panel"><div className="panel-heading"><div><span className="panel-kicker">Projects</span><h2>Project health</h2></div><button className="icon-button muted"><Icon name="dots" size={17} /></button></div><div className="project-health">{projects.map((project) => <div className="health-row" key={project.name}><div className="health-name"><i style={{ background: project.color }}></i><span>{project.name}</span></div><div className="health-bar"><b style={{ width: `${Math.max(22, project.count * 4)}%`, background: project.color }}></b></div><span>{project.count}</span></div>)}</div></div>
-    </section>
-  </div>;
+function Workspace({ session, refreshSession, onLogout }: { session: Session; refreshSession: () => Promise<Session>; onLogout: () => Promise<void> }) {
+  const [activeOrgId, setActiveOrgId] = useState(session.organizations[0]?.id ?? '');
+  const [projects, setProjects] = useState<Project[]>([]); const [reports, setReports] = useState<Report[]>([]);
+  const [view, setView] = useState<View>('Dashboard'); const [query, setQuery] = useState(''); const [selected, setSelected] = useState<Report | null>(null);
+  const [showCreate, setShowCreate] = useState(false); const [toast, setToast] = useState(''); const [error, setError] = useState('');
+  const activeOrg = session.organizations.find((org) => org.id === activeOrgId) ?? session.organizations[0];
+  const notify = (message: string) => { setToast(message); window.setTimeout(() => setToast(''), 3200); };
+  const loadWorkspace = async () => { if (!activeOrg) return; setError(''); try { const [projectData, reportData] = await Promise.all([api<{ projects: Project[] }>(`/api/organizations/${activeOrg.id}/projects`), api<{ reports: Report[] }>(`/api/organizations/${activeOrg.id}/reports`)]); setProjects(projectData.projects); setReports(reportData.reports); } catch (err) { setError(err instanceof Error ? err.message : 'Unable to load workspace data.'); } };
+  useEffect(() => { setActiveOrgId(session.organizations[0]?.id ?? ''); }, [session.organizations]);
+  useEffect(() => { void loadWorkspace(); }, [activeOrgId]);
+  const visibleReports = useMemo(() => reports.filter((report) => `${reportCode(report)} ${report.title} ${report.projectName} ${report.reporterName} ${(report.labels ?? []).join(' ')}`.toLowerCase().includes(query.toLowerCase())), [reports, query]);
+  const openReports = reports.filter((report) => !['resolved', 'closed'].includes(report.status));
+  const criticalReports = openReports.filter((report) => report.priority === 'critical');
+  const setStatus = async (report: Report, status: Status) => { try { await api(`/api/reports/${report.id}/status`, { method: 'PATCH', body: JSON.stringify({ status }) }); setReports((current) => current.map((entry) => entry.id === report.id ? { ...entry, status, updatedAt: new Date().toISOString() } : entry)); setSelected((current) => current?.id === report.id ? { ...current, status } : current); notify(`${reportCode(report)} moved to ${statusLabel(status)}.`); } catch (err) { notify(err instanceof Error ? err.message : 'Unable to update report status.'); } };
+  const createReport = async (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const form = new FormData(event.currentTarget); try { const created = await api<Report>(`/api/reports`, { method: 'POST', body: JSON.stringify({ projectId: String(form.get('projectId')), title: String(form.get('title')), description: String(form.get('description')), reproductionSteps: String(form.get('reproductionSteps') || ''), expectedResult: String(form.get('expectedResult') || ''), actualResult: String(form.get('actualResult') || ''), browserDevice: String(form.get('browserDevice') || ''), applicationVersion: String(form.get('applicationVersion') || ''), priority: String(form.get('priority')) }) }); const file = form.get('attachment'); if (file instanceof File && file.size) { const upload = new FormData(); upload.append('file', file); await api(`/api/reports/${created.id}/attachments`, { method: 'POST', body: upload }); } setShowCreate(false); await loadWorkspace(); setView('Reports'); notify('Report created and added to the triage queue.'); } catch (err) { notify(err instanceof Error ? err.message : 'Unable to create report.'); } };
+  const postComment = async (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); if (!selected) return; const form = new FormData(event.currentTarget); const body = String(form.get('body') ?? '').trim(); if (!body) return; try { await api(`/api/reports/${selected.id}/comments`, { method: 'POST', body: JSON.stringify({ body, visibility: form.get('visibility') === 'internal' ? 'internal' : 'customer' }) }); (event.currentTarget as HTMLFormElement).reset(); notify('Update saved and notification workflow queued.'); } catch (err) { notify(err instanceof Error ? err.message : 'Unable to post the update.'); } };
+  return <div className="app-shell"><aside className="sidebar"><div className="brand-row"><div className="brand-mark"><span></span><span></span><span></span></div><strong>BugFlow</strong></div><label className="organization-switcher"><span className="org-logo">{activeOrg?.name.slice(0, 1) ?? 'B'}</span><span className="organization-copy"><strong>{activeOrg?.name ?? 'Workspace'}</strong><small>{activeOrg?.role.replace('_', ' ') ?? 'Organization'}</small></span><select aria-label="Switch organization" value={activeOrgId} onChange={(event) => setActiveOrgId(event.target.value)}>{session.organizations.map((org) => <option key={org.id} value={org.id}>{org.name}</option>)}</select></label><nav className="primary-nav">{([{ label: 'Dashboard', icon: 'grid' }, { label: 'Reports', icon: 'bug' }, { label: 'Projects', icon: 'folder' }] as const).map((item) => <button key={item.label} className={`nav-item ${view === item.label ? 'active' : ''}`} onClick={() => setView(item.label)}><Icon name={item.icon} /><span>{item.label}</span>{item.label === 'Reports' ? <em className="nav-badge">{openReports.length}</em> : null}</button>)}</nav><div className="nav-section"><div className="section-title"><span>Projects</span><span>{projects.length}</span></div>{projects.slice(0, 6).map((project) => <button key={project.id} className="project-nav" onClick={() => { setQuery(project.name); setView('Reports'); }}><i style={{ background: project.color }}></i><span>{project.name}</span><em>{project.openReportCount}</em></button>)}</div><div className="sidebar-footer"><div className="user-chip"><span className="avatar violet">{session.user.displayName.split(' ').map((part) => part[0]).join('').slice(0, 2)}</span><span><strong>{session.user.displayName}</strong><small>{session.user.isPlatformAdmin ? 'Platform admin' : activeOrg?.role.replace('_', ' ')}</small></span><button className="icon-button" title="Sign out" onClick={() => void onLogout()}><Icon name="logout" /></button></div></div></aside><main className="workspace"><header className="topbar"><label className="search-box"><Icon name="search" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search reports, projects, people…" /></label><button className="new-report" disabled={!projects.length} onClick={() => setShowCreate(true)}><Icon name="plus" /> New report</button></header>{error ? <div className="workspace-error">{error}</div> : null}{view === 'Dashboard' ? <Dashboard reports={reports} projects={projects} onViewReports={() => setView('Reports')} onSelect={setSelected} /> : null}{view === 'Reports' ? <ReportsView reports={visibleReports} onSelect={setSelected} onCreate={() => setShowCreate(true)} /> : null}{view === 'Projects' ? <ProjectsView projects={projects} onProject={(project) => { setQuery(project.name); setView('Reports'); }} /> : null}</main>{showCreate ? <CreateReportModal projects={projects} onClose={() => setShowCreate(false)} onCreate={createReport} /> : null}{selected ? <ReportDrawer report={selected} onClose={() => setSelected(null)} onStatus={setStatus} onComment={postComment} /> : null}{toast ? <div className="toast">{toast}</div> : null}</div>;
 }
 
-function MetricCard({ label, value, detail, tone, icon }: { label: string; value: string; detail: string; tone: string; icon: string }) {
-  return <div className={`metric-card ${tone}`}><div className="metric-icon"><Icon name={icon} size={17} /></div><span>{label}</span><strong>{value}</strong><small>{detail}</small></div>;
+function Dashboard({ reports, projects, onViewReports, onSelect }: { reports: Report[]; projects: Project[]; onViewReports: () => void; onSelect: (report: Report) => void }) {
+  const open = reports.filter((report) => !['resolved', 'closed'].includes(report.status)); const critical = open.filter((report) => report.priority === 'critical'); const inProgress = open.filter((report) => report.status === 'in_progress');
+  return <div className="page dashboard-page"><div className="page-intro"><div><p className="eyebrow">Live workspace</p><h1>Product signal, in one flow.</h1><p className="subtle">Reports, customer communication, and ownership are loaded from your BugFlow workspace.</p></div><button className="text-button" onClick={onViewReports}>View all reports <Icon name="arrow" /></button></div><section className="metric-grid"><Metric label="Open reports" value={open.length} detail="Across accessible projects" tone="violet"/><Metric label="Needs attention" value={critical.length} detail="Critical priority" tone="rose"/><Metric label="In progress" value={inProgress.length} detail="Assigned to the team" tone="mint"/><Metric label="Projects" value={projects.length} detail="Available to this user" tone="gold"/></section><section className="dashboard-grid"><div className="panel reports-panel"><div className="panel-heading"><div><span className="panel-kicker">Triage queue</span><h2>Recently updated</h2></div></div><div className="issue-list compact-list">{reports.slice(0, 6).map((report) => <ReportRow key={report.id} report={report} onSelect={onSelect}/>) || <Empty title="No reports yet" copy="Create the first report to begin triage."/>}</div></div><div className="panel project-panel"><div className="panel-heading"><div><span className="panel-kicker">Projects</span><h2>Project health</h2></div></div><div className="project-health">{projects.map((project) => <div className="health-row" key={project.id}><div className="health-name"><i style={{ background: project.color }}></i><span>{project.name}</span></div><div className="health-bar"><b style={{ width: `${Math.min(100, Math.max(8, project.openReportCount * 12))}%`, background: project.color }}></b></div><span>{project.openReportCount}</span></div>) || <Empty title="No accessible projects" copy="An administrator can add projects and grant access."/>}</div></div></section></div>;
 }
-
-function StatusRow({ color, label, value }: { color: string; label: string; value: number }) {
-  return <div className="status-row"><i style={{ background: color }}></i><span>{label}</span><strong>{value}</strong></div>;
-}
-
-function IssuesView({ issues, statusFilter, onStatusFilter, onSelect, onCreate }: { issues: Issue[]; statusFilter: Status | 'All'; onStatusFilter: (status: Status | 'All') => void; onSelect: (issue: Issue) => void; onCreate: () => void }) {
-  return <div className="page issues-page">
-    <div className="page-intro"><div><p className="eyebrow">Northstar / All projects</p><h1>Issues</h1><p className="subtle">Track, discuss, and resolve every customer-reported problem.</p></div><button className="new-report" onClick={onCreate}><Icon name="plus" size={16} /> New report</button></div>
-    <div className="issues-toolbar"><div className="filter-group"><button className="filter-button"><Icon name="filter" size={15} /> Filters <span>0</span></button><div className="status-tabs">{(['All', ...statusOrder] as const).map((status) => <button key={status} onClick={() => onStatusFilter(status)} className={statusFilter === status ? 'selected' : ''}>{status}</button>)}</div></div><button className="view-toggle"><span></span><span></span><span></span></button></div>
-    <div className="issues-table panel"><div className="table-head"><span>Issue</span><span>Status</span><span>Priority</span><span>Project</span><span>Assignee</span><span>Updated</span></div><div className="issue-list">{issues.length ? issues.map((issue) => <IssueRow issue={issue} key={issue.id} onSelect={onSelect} detailed />) : <div className="empty-state"><Icon name="search" size={28} /><h3>No reports found</h3><p>Try adjusting your search or status filter.</p></div>}</div></div>
-  </div>;
-}
-
-function IssueRow({ issue, onSelect, detailed = false }: { issue: Issue; onSelect: (issue: Issue) => void; detailed?: boolean }) {
-  return <button className={`issue-row ${detailed ? 'detailed-row' : ''}`} onClick={() => onSelect(issue)}><div className="issue-primary"><span className={priorityClass(issue.priority)}></span><div><div className="issue-title-line"><strong>{issue.id}</strong><h3>{issue.title}</h3></div><div className="issue-meta"><span>{issue.labels.map((label) => <em key={label}>{label}</em>)}</span>{!detailed ? <><span className="dot-separator">•</span><span>{issue.project}</span></> : null}</div></div></div>{detailed ? <><span><b className={statusClass(issue.status)}>{issue.status}</b></span><span className="priority-text">{issue.priority}</span><span>{issue.project}</span><span className="assignee-cell"><Avatar name={issue.assignee} small /> {issue.assignee}</span><span>{issue.updated}</span></> : <div className="compact-info"><b className={statusClass(issue.status)}>{issue.status}</b><Avatar name={issue.assignee} small /><span>{issue.updated}</span></div>}</button>;
-}
-
-function ProjectsView({ onProject }: { onProject: (project: string) => void }) {
-  return <div className="page projects-page"><div className="page-intro"><div><p className="eyebrow">Northstar workspace</p><h1>Projects</h1><p className="subtle">Organize bug reporting around the work your customers rely on.</p></div><button className="new-report" onClick={() => {}}><Icon name="plus" size={16} /> New project</button></div><div className="projects-grid">{projects.map((project, index) => <button className="project-card" key={project.name} onClick={() => onProject(project.name)}><div className="project-card-top"><span className="project-symbol" style={{ color: project.color, borderColor: `${project.color}55` }}>{project.name.slice(0, 1)}</span><Icon name="arrow" size={16} /></div><h2>{project.name}</h2><p>{index === 0 ? 'Customer-facing mobile experiences and incident reports.' : index === 1 ? 'Shared workspaces, membership, and access controls.' : index === 2 ? 'Analytics exports, dashboards, and reporting APIs.' : 'The administration console and team workflows.'}</p><div className="project-card-bottom"><span><b>{project.count}</b> open reports</span><em style={{ color: project.color }}>{project.trend}</em></div></button>)}</div></div>;
-}
-
-function ActivityView() {
-  return <div className="page activity-page"><div className="page-intro"><div><p className="eyebrow">Northstar workspace</p><h1>Activity</h1><p className="subtle">A tamper-evident timeline of work, access, and customer communication.</p></div><button className="filter-button"><Icon name="filter" size={15} /> All activity</button></div><div className="activity-panel panel"><div className="activity-day">Today</div><ActivityItem actor="Maya Patel" action="moved BF-184 to In Progress" context="Pulse Mobile" tone="violet" /><ActivityItem actor="Jordan Lee" action="posted a customer-visible update" context="BF-177" tone="peach" /><ActivityItem actor="System" action="sent a status-update email to Axiom Labs" context="Delivery confirmed" tone="slate" /><div className="activity-day">Yesterday</div><ActivityItem actor="Ana Rivera" action="resolved BF-169" context="Console" tone="mint" /><ActivityItem actor="Maya Patel" action="granted customer access to Reporting" context="Axiom Labs" tone="violet" /></div></div>;
-}
-
-function ActivityItem({ actor, action, context, tone }: { actor: string; action: string; context: string; tone: string }) {
-  return <div className="activity-item"><Avatar name={actor === 'System' ? 'System' : actor} small /><div><p><strong>{actor}</strong> {action}</p><span>{context} <b>·</b> {actor === 'System' ? 'Yesterday at 4:21 PM' : 'Today at 10:42 AM'}</span></div><button className="icon-button muted"><Icon name="dots" size={16} /></button></div>;
-}
-
-function IssueDrawer({ issue, onClose, onMove, onNotify }: { issue: Issue; onClose: () => void; onMove: (issue: Issue, status: Status) => void; onNotify: (message: string) => void }) {
-  const [comment, setComment] = useState('');
-  const [internal, setInternal] = useState(false);
-  return <div className="overlay" role="dialog" aria-modal="true" aria-label={`Issue ${issue.id}`}><div className="issue-drawer"><header className="drawer-header"><div className="drawer-breadcrumb"><span>{issue.project}</span><b>/</b><strong>{issue.id}</strong></div><div><button className="icon-button muted" onClick={() => onNotify('Issue link copied to clipboard.')}>↗</button><button className="icon-button muted" onClick={onClose} aria-label="Close issue"><Icon name="close" size={18} /></button></div></header><div className="drawer-content"><div className="issue-main"><div className="issue-detail-title"><span className={priorityClass(issue.priority)}></span><h1>{issue.title}</h1></div><div className="detail-chips"><b className={statusClass(issue.status)}>{issue.status}</b><span className="detail-chip"><Icon name="lock" size={13} /> Customer visible</span></div><div className="description"><h3>Description</h3><p>{issue.description}</p><h3>Expected result</h3><p>The experience should preserve the current customer session and resume normally without a manual recovery step.</p></div><div className="divider"></div><div className="conversation-heading"><div><h3>Activity & discussion</h3><p>Customer-visible updates are sent by email automatically.</p></div><button className="watch-button" onClick={() => onNotify('You are now watching this report.')}><Icon name="bell" size={14} /> Watching</button></div><div className="comment-thread"><Comment author="Maya Patel" time="8 minutes ago" body="We reproduced this on iOS 18.5 and have assigned the investigation to the mobile team." /><Comment author="Northstar Health" time="31 minutes ago" body="Thank you. We can provide a screen recording if that would help your team." customer /></div><form className="comment-box" onSubmit={(event) => { event.preventDefault(); if (comment.trim()) { onNotify(internal ? 'Internal note added.' : 'Customer update sent.'); setComment(''); } }}><textarea value={comment} onChange={(event) => setComment(event.target.value)} placeholder={internal ? 'Write an internal note…' : 'Write a customer-visible update…'} /><div><button type="button" className={`visibility-toggle ${internal ? 'internal' : ''}`} onClick={() => setInternal((current) => !current)}><Icon name={internal ? 'lock' : 'comment'} size={13} /> {internal ? 'Internal only' : 'Customer visible'}</button><div><button type="button" className="icon-button muted" onClick={() => onNotify('Attachment picker would open here.')}><Icon name="plus" size={16} /></button><button className="send-button" type="submit">Send <Icon name="arrow" size={14} /></button></div></div></form></div><aside className="issue-properties"><Property label="Status"><select value={issue.status} onChange={(event) => onMove(issue, event.target.value as Status)}>{statusOrder.map((status) => <option key={status}>{status}</option>)}</select></Property><Property label="Priority"><span className="property-value"><span className={priorityClass(issue.priority)}></span>{issue.priority}</span></Property><Property label="Assignee"><span className="property-value"><Avatar name={issue.assignee} small />{issue.assignee}</span></Property><Property label="Project"><span className="property-value"><i className="mini-project-dot"></i>{issue.project}</span></Property><Property label="Due date"><span className="property-value"><Icon name="calendar" size={14} />{issue.due}</span></Property><Property label="Labels"><div className="label-stack">{issue.labels.map((label) => <em key={label}>{label}</em>)}</div></Property><div className="property-divider"></div><button className="danger-link" onClick={() => onNotify('This report would be soft-deleted and remains recoverable by an administrator.')}>Soft-delete report</button></aside></div></div></div>;
-}
-
-function Property({ label, children }: { label: string; children: ReactNode }) { return <div className="property"><span>{label}</span>{children}</div>; }
-function Comment({ author, time, body, customer = false }: { author: string; time: string; body: string; customer?: boolean }) { return <div className="comment"><Avatar name={author} small /><div><p><strong>{author}</strong>{customer ? <em>Customer</em> : null}<span>{time}</span></p><div>{body}</div></div></div>; }
-
-function CreateReportModal({ onClose, onCreate }: { onClose: () => void; onCreate: (event: FormEvent<HTMLFormElement>) => void }) {
-  return <div className="overlay" role="dialog" aria-modal="true" aria-label="New bug report"><form className="create-modal" onSubmit={onCreate}><header><div><p className="eyebrow">New report</p><h2>Capture a bug clearly</h2></div><button type="button" className="icon-button muted" onClick={onClose}><Icon name="close" size={18} /></button></header><label>Title<input required name="title" autoFocus placeholder="What happened?" /></label><div className="form-two"><label>Project<select name="project">{projects.map((project) => <option key={project.name}>{project.name}</option>)}</select></label><label>Priority<select name="priority">{priorityOrder.map((priority) => <option key={priority} selected={priority === 'Medium'}>{priority}</option>)}</select></label></div><label>Description<textarea required name="description" placeholder="Include steps to reproduce, expected result, actual result, browser/device, and app version." /></label><div className="upload-well"><Icon name="plus" size={18} /><div><strong>Add evidence</strong><span>Drop screenshots, recordings, or files here</span></div><button type="button">Browse</button></div><footer><button type="button" className="cancel-button" onClick={onClose}>Cancel</button><button className="send-button" type="submit">Create report <Icon name="arrow" size={14} /></button></footer></form></div>;
-}
+function Metric({ label, value, detail, tone }: { label: string; value: number; detail: string; tone: string }) { return <div className={`metric-card ${tone}`}><span>{label}</span><strong>{value}</strong><small>{detail}</small></div>; }
+function Empty({ title, copy }: { title: string; copy: string }) { return <div className="empty-state"><Icon name="folder"/><h3>{title}</h3><p>{copy}</p></div>; }
+function ReportsView({ reports, onSelect, onCreate }: { reports: Report[]; onSelect: (report: Report) => void; onCreate: () => void }) { return <div className="page issues-page"><div className="page-intro"><div><p className="eyebrow">Customer reports</p><h1>Reports</h1><p className="subtle">Search, inspect, and move the issues your customers and team are tracking.</p></div><button className="new-report" onClick={onCreate}><Icon name="plus"/> New report</button></div><div className="issues-table panel"><div className="table-head"><span>Report</span><span>Status</span><span>Priority</span><span>Project</span><span>Updated</span></div><div className="issue-list">{reports.length ? reports.map((report) => <ReportRow key={report.id} report={report} detailed onSelect={onSelect}/>) : <Empty title="No reports found" copy="Adjust your search or create a new report."/>}</div></div></div>; }
+function ReportRow({ report, onSelect, detailed = false }: { report: Report; onSelect: (report: Report) => void; detailed?: boolean }) { return <button className={`issue-row ${detailed ? 'detailed-row' : ''}`} onClick={() => onSelect(report)}><div className="issue-primary"><span className={`priority priority-${report.priority}`}></span><div><div className="issue-title-line"><strong>{reportCode(report)}</strong><h3>{report.title}</h3></div><div className="issue-meta"><span>{(report.labels ?? []).map((label) => <em key={label}>{label}</em>)}</span><span>{report.reporterName}</span></div></div></div>{detailed ? <><span><b className={`status status-${report.status.replace('_', '-')}`}>{statusLabel(report.status)}</b></span><span className="priority-text">{priorityLabel(report.priority)}</span><span>{report.projectName}</span><span>{relativeDate(report.updatedAt)}</span></> : <div className="compact-info"><b className={`status status-${report.status.replace('_', '-')}`}>{statusLabel(report.status)}</b><span>{relativeDate(report.updatedAt)}</span></div>}</button>; }
+function relativeDate(value: string) { const time = Date.parse(value); if (Number.isNaN(time)) return 'Recently'; const delta = Math.max(0, Math.floor((Date.now() - time) / 60000)); return delta < 2 ? 'Just now' : delta < 60 ? `${delta}m ago` : delta < 1440 ? `${Math.floor(delta / 60)}h ago` : `${Math.floor(delta / 1440)}d ago`; }
+function ProjectsView({ projects, onProject }: { projects: Project[]; onProject: (project: Project) => void }) { return <div className="page projects-page"><div className="page-intro"><div><p className="eyebrow">Organization workspace</p><h1>Projects</h1><p className="subtle">Projects control where your teams and customers can collaborate.</p></div></div><div className="projects-grid">{projects.map((project) => <button className="project-card" key={project.id} onClick={() => onProject(project)}><div className="project-card-top"><span className="project-symbol" style={{ color: project.color, borderColor: `${project.color}55` }}>{project.name.slice(0, 1)}</span><Icon name="arrow"/></div><h2>{project.name}</h2><p>{project.description || 'No project description has been added.'}</p><div className="project-card-bottom"><span><b>{project.openReportCount}</b> open reports</span></div></button>)}{!projects.length ? <Empty title="No projects available" copy="Your organization administrator can add a project and assign access."/> : null}</div></div>; }
+function CreateReportModal({ projects, onClose, onCreate }: { projects: Project[]; onClose: () => void; onCreate: (event: FormEvent<HTMLFormElement>) => void }) { return <div className="overlay"><form className="create-modal live-form" onSubmit={onCreate}><header><div><p className="eyebrow">New report</p><h2>Capture the complete signal</h2></div><button type="button" className="icon-button muted" onClick={onClose}><Icon name="close"/></button></header><label>Title<input required name="title" placeholder="What happened?" /></label><div className="form-two"><label>Project<select required name="projectId">{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label><label>Priority<select name="priority" defaultValue="medium">{priorityOrder.map((priority) => <option key={priority} value={priority}>{priorityLabel(priority)}</option>)}</select></label></div><label>Description<textarea required name="description" placeholder="Explain the problem and its impact."/></label><label>Steps to reproduce<textarea name="reproductionSteps" placeholder="1. Go to… 2. Click… 3. Observe…"/></label><div className="form-two"><label>Expected result<input name="expectedResult" placeholder="What should have happened?"/></label><label>Actual result<input name="actualResult" placeholder="What happened instead?"/></label></div><div className="form-two"><label>Browser / device<input name="browserDevice" placeholder="Safari on iPhone 15"/></label><label>App version<input name="applicationVersion" placeholder="v2.4.0"/></label></div><label className="file-field">Attach evidence <input name="attachment" type="file"/><small>One file up to 25 MB; stored privately in Railway Object Storage.</small></label><footer><button type="button" className="cancel-button" onClick={onClose}>Cancel</button><button className="send-button">Create report <Icon name="arrow"/></button></footer></form></div>; }
+function ReportDrawer({ report, onClose, onStatus, onComment }: { report: Report; onClose: () => void; onStatus: (report: Report, status: Status) => void; onComment: (event: FormEvent<HTMLFormElement>) => void }) { return <div className="overlay"><section className="issue-drawer"><header className="drawer-header"><div className="drawer-breadcrumb"><span>{report.projectName}</span><b>/</b><strong>{reportCode(report)}</strong></div><button className="icon-button muted" onClick={onClose}><Icon name="close"/></button></header><div className="drawer-content"><div className="issue-main"><div className="issue-detail-title"><span className={`priority priority-${report.priority}`}></span><h1>{report.title}</h1></div><div className="detail-chips"><b className={`status status-${report.status.replace('_', '-')}`}>{statusLabel(report.status)}</b><span className="detail-chip"><Icon name="lock"/> Customer-visible updates send by email</span></div><div className="description"><h3>Report details</h3><p>This report was submitted by {report.reporterName}. Use a customer-visible comment to provide an update, or an internal note to keep discussion within the team.</p></div><div className="divider"></div><form className="comment-box" onSubmit={onComment}><textarea name="body" required placeholder="Write a customer-visible update…"/><div><label className="visibility-choice"><input name="visibility" type="radio" value="customer" defaultChecked/> Customer visible</label><label className="visibility-choice"><input name="visibility" type="radio" value="internal"/> Internal only</label><button className="send-button">Send <Icon name="arrow"/></button></div></form></div><aside className="issue-properties"><div className="property"><span>Status</span><select value={report.status} onChange={(event) => onStatus(report, event.target.value as Status)}>{statusOrder.map((status) => <option key={status} value={status}>{statusLabel(status)}</option>)}</select></div><div className="property"><span>Priority</span><b>{priorityLabel(report.priority)}</b></div><div className="property"><span>Project</span><b>{report.projectName}</b></div><div className="property"><span>Reporter</span><b>{report.reporterName}</b></div><div className="property"><span>Updated</span><b>{relativeDate(report.updatedAt)}</b></div></aside></div></section></div>; }

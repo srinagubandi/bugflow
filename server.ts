@@ -172,6 +172,44 @@ app.post('/api/auth/logout', async (request: AppRequest, response) => {
   response.status(204).end();
 });
 
+app.get('/api/auth/session', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+
+  const organizations = await query<{ id: string; name: string; slug: string; role: string }>(
+    actor.isPlatformAdmin
+      ? `SELECT o.id, o.name, o.slug, 'platform_admin' AS role FROM organizations o WHERE o.is_active = true AND o.deleted_at IS NULL ORDER BY o.name`
+      : `SELECT o.id, o.name, o.slug, m.role
+         FROM memberships m JOIN organizations o ON o.id = m.organization_id
+         WHERE m.user_id = $1 AND m.is_active = true AND o.is_active = true AND o.deleted_at IS NULL
+         ORDER BY o.name`,
+    actor.isPlatformAdmin ? [] : [actor.id],
+  );
+
+  response.json({ user: actor, organizations: organizations.rows });
+});
+
+app.get('/api/organizations/:organizationId/projects', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const organizationId = routeParam(request.params.organizationId);
+  const role = actor.isPlatformAdmin ? 'admin' : await organizationRole(actor.id, organizationId);
+  if (!role) return response.status(403).json({ error: 'You do not have access to this organization.' });
+
+  const result = await query(
+    `SELECT p.id, p.name, p.slug, p.description, p.color, p.created_at AS "createdAt",
+            COUNT(r.id) FILTER (WHERE r.deleted_at IS NULL AND r.status NOT IN ('resolved', 'closed'))::int AS "openReportCount"
+     FROM projects p
+     LEFT JOIN reports r ON r.project_id = p.id
+     WHERE p.organization_id = $1 AND p.is_active = true AND p.deleted_at IS NULL
+       AND ($2::boolean = true OR EXISTS (SELECT 1 FROM project_access pa WHERE pa.project_id = p.id AND pa.user_id = $3 AND pa.can_view = true))
+     GROUP BY p.id
+     ORDER BY p.name`,
+    [organizationId, role === 'admin' || actor.isPlatformAdmin, actor.id],
+  );
+  response.json({ projects: result.rows });
+});
+
 app.post('/api/platform/organizations', async (request: AppRequest, response) => {
   const actor = requireUser(request, response);
   if (!actor) return;
