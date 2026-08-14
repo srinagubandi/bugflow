@@ -129,6 +129,36 @@ async function reportAccess(user: CurrentUser, reportId: string, action: 'view' 
   return { allowed: true, report: item } as const;
 }
 
+/** Customer-visible updates always create an in-product notification; email is attempted only when configured. */
+async function notifyReporterOfVisibleUpdate(input: { reportId: string; actorId: string; type: string; update: string }) {
+  const context = await query<{ organization_id: string; sequence_number: number; title: string; reporter_id: string; email: string; organization_name: string; sender_name: string | null; reply_to_email: string | null }>(
+    `SELECT r.organization_id, r.sequence_number, r.title, r.reporter_id, u.email, o.name AS organization_name, o.sender_name, o.reply_to_email
+     FROM reports r JOIN users u ON u.id = r.reporter_id JOIN organizations o ON o.id = r.organization_id WHERE r.id = $1`,
+    [input.reportId],
+  );
+  const item = context.rows[0];
+  if (!item || item.reporter_id === input.actorId) return;
+  const title = `Update on BF-${item.sequence_number}`;
+  const notification = await query<{ id: string }>(
+    `INSERT INTO notifications (organization_id, user_id, report_id, type, title, body)
+     VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+    [item.organization_id, item.reporter_id, input.reportId, input.type, title, input.update],
+  );
+  try {
+    const appUrl = process.env.APP_URL || 'https://bugflow-app-production.up.railway.app';
+    const delivery = await sendBugFlowEmail({
+      to: item.email,
+      subject: title,
+      html: reportUpdateEmail({ organizationName: item.organization_name, reportId: `BF-${item.sequence_number}`, reportTitle: item.title, update: input.update, url: `${appUrl}/?report=${input.reportId}` }),
+      fromName: item.sender_name ?? item.organization_name,
+      replyTo: item.reply_to_email,
+    });
+    if (delivery.sent) await query('UPDATE notifications SET email_sent_at = now() WHERE id = $1', [notification.rows[0].id]);
+  } catch (error) {
+    console.error('Customer update email could not be delivered', error);
+  }
+}
+
 const loginSchema = z.object({ identifier: z.string().min(1), password: z.string().min(8) });
 const organizationSchema = z.object({ name: z.string().min(2).max(120), slug: z.string().regex(/^[a-z0-9-]+$/), admin: z.object({ username: z.string().min(3).max(60), email: z.string().email(), displayName: z.string().min(2).max(120), password: z.string().min(12).max(200) }) });
 const projectSchema = z.object({ name: z.string().min(2).max(120), slug: z.string().regex(/^[a-z0-9-]+$/), description: z.string().max(500).optional(), color: z.string().regex(/^#[0-9a-fA-F]{6}$/).default('#8176ff') });
@@ -138,6 +168,23 @@ const reportSchema = z.object({ projectId: z.string().uuid(), title: z.string().
 const commentSchema = z.object({ body: z.string().min(1).max(20000), visibility: z.enum(['customer', 'internal']).default('customer') });
 const passwordResetRequestSchema = z.object({ email: z.string().email() });
 const passwordResetConfirmSchema = z.object({ token: z.string().min(20), password: z.string().min(12).max(200) });
+
+/** These schemas keep every property-rail update explicit and auditable. */
+const reportUpdateSchema = z.object({
+  title: z.string().min(4).max(240).optional(),
+  description: z.string().min(4).max(20000).optional(),
+  reproductionSteps: z.string().max(20000).nullable().optional(),
+  expectedResult: z.string().max(20000).nullable().optional(),
+  actualResult: z.string().max(20000).nullable().optional(),
+  browserDevice: z.string().max(500).nullable().optional(),
+  applicationVersion: z.string().max(200).nullable().optional(),
+  priority: z.enum(['low', 'medium', 'high', 'critical']).optional(),
+  dueAt: z.string().datetime().nullable().optional(),
+}).refine((value) => Object.keys(value).length > 0, 'Provide at least one report field.');
+const assigneeSchema = z.object({ assigneeId: z.string().uuid().nullable() });
+const labelSchema = z.object({ name: z.string().min(1).max(60), color: z.string().regex(/^#[0-9a-fA-F]{6}$/).default('#6750A4') });
+const reportLabelSchema = z.object({ labelId: z.string().uuid() });
+const duplicateSchema = z.object({ duplicateOfId: z.string().uuid() });
 
 app.get('/api/health', (_request, response) => {
   response.json({ status: 'ok', service: 'bugflow', storageConfigured: storageIsConfigured(), timestamp: new Date().toISOString() });
@@ -174,22 +221,35 @@ app.post('/api/auth/logout', async (request: AppRequest, response) => {
   response.status(204).end();
 });
 
-
-
 app.post('/api/auth/password-reset/request', async (request: Request, response: Response) => {
   const parsed = passwordResetRequestSchema.safeParse(request.body);
   if (!parsed.success) return response.status(400).json({ error: 'Provide a valid email address.' });
+
   try {
-    const account = await query<{ id: string; email: string; display_name: string }>('SELECT id, email, display_name FROM users WHERE email = $1 AND is_active = true AND deleted_at IS NULL', [parsed.data.email]);
+    const account = await query<{ id: string; email: string; display_name: string }>(
+      'SELECT id, email, display_name FROM users WHERE email = $1 AND is_active = true AND deleted_at IS NULL',
+      [parsed.data.email],
+    );
     if (!account.rowCount) return response.status(202).json({ accepted: true });
+
     const token = randomBytes(32).toString('base64url');
-    await query("INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, now() + interval '1 hour')", [account.rows[0].id, hashToken(token)]);
-    const appUrl = process.env.APP_URL || request.protocol + '://' + request.get('host');
-    const resetUrl = appUrl + '/?reset=' + encodeURIComponent(token);
-    await sendBugFlowEmail({ to: account.rows[0].email, subject: 'Reset your BugFlow password', html: '<div style="font-family:Inter,Arial,sans-serif;color:#24242a;line-height:1.5"><p style="color:#6b61dd;font-weight:700">BugFlow</p><h2>Reset your password</h2><p>Hello ' + account.rows[0].display_name + ', use the secure link below within one hour.</p><p><a href="' + resetUrl + '" style="display:inline-block;background:#6257dc;color:#fff;padding:10px 16px;border-radius:8px;text-decoration:none">Reset password</a></p><p style="color:#666;font-size:12px">If you did not request this change, you can ignore this email.</p></div>' });
+    await query('INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, now() + interval \'1 hour\')', [account.rows[0].id, hashToken(token)]);
+    const appUrl = process.env.APP_URL || `${request.protocol}://${request.get('host')}`;
+    const resetUrl = `${appUrl}/?reset=${encodeURIComponent(token)}`;
+    const delivery = await sendBugFlowEmail({
+      to: account.rows[0].email,
+      subject: 'Reset your BugFlow password',
+      html: `<div style="font-family:Inter,Arial,sans-serif;color:#24242a;line-height:1.5"><p style="color:#6b61dd;font-weight:700">BugFlow</p><h2>Reset your password</h2><p>Hello ${account.rows[0].display_name}, use the secure link below within one hour.</p><p><a href="${resetUrl}" style="display:inline-block;background:#6257dc;color:#fff;padding:10px 16px;border-radius:8px;text-decoration:none">Reset password</a></p><p style="color:#666;font-size:12px">If you did not request this change, you can ignore this email.</p></div>`,
+    });
+    if (!delivery.sent) {
+      await query('DELETE FROM password_reset_tokens WHERE token_hash = $1', [hashToken(token)]);
+      return response.status(503).json({ error: 'Password reset email delivery is not configured. Contact your administrator.' });
+    }
     await writeAuditEvent({ actorId: account.rows[0].id, entityType: 'authentication', action: 'password_reset_requested', ipAddress: clientIp(request) });
     return response.status(202).json({ accepted: true });
-  } catch (error) { return response.status(503).json({ error: 'Password reset email delivery is not configured. Contact your administrator.' }); }
+  } catch (error) {
+    return response.status(503).json({ error: 'Password reset email delivery is not configured. Contact your administrator.' });
+  }
 });
 
 app.post('/api/auth/password-reset/confirm', async (request: Request, response: Response) => {
@@ -198,10 +258,16 @@ app.post('/api/auth/password-reset/confirm', async (request: Request, response: 
   try {
     const reset = await query<{ id: string; user_id: string }>('SELECT id, user_id FROM password_reset_tokens WHERE token_hash = $1 AND expires_at > now() AND used_at IS NULL', [hashToken(parsed.data.token)]);
     if (!reset.rowCount) return response.status(400).json({ error: 'This password-reset link is invalid or has expired.' });
-    await withTransaction(async (client) => { await client.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hashPassword(parsed.data.password), reset.rows[0].user_id]); await client.query('UPDATE password_reset_tokens SET used_at = now() WHERE id = $1', [reset.rows[0].id]); await client.query('DELETE FROM sessions WHERE user_id = $1', [reset.rows[0].user_id]); });
+    await withTransaction(async (client) => {
+      await client.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hashPassword(parsed.data.password), reset.rows[0].user_id]);
+      await client.query('UPDATE password_reset_tokens SET used_at = now() WHERE id = $1', [reset.rows[0].id]);
+      await client.query('DELETE FROM sessions WHERE user_id = $1', [reset.rows[0].user_id]);
+    });
     await writeAuditEvent({ actorId: reset.rows[0].user_id, entityType: 'authentication', action: 'password_reset_completed', ipAddress: clientIp(request) });
     return response.status(204).end();
-  } catch (error) { return response.status(503).json({ error: 'Password reset is temporarily unavailable.' }); }
+  } catch (error) {
+    return response.status(503).json({ error: 'Password reset is temporarily unavailable.' });
+  }
 });
 
 app.get('/api/auth/session', async (request: AppRequest, response) => {
@@ -341,6 +407,11 @@ app.get('/api/organizations/:organizationId/reports', async (request: AppRequest
   if (!role) return response.status(403).json({ error: 'You do not have access to this organization.' });
 
   const status = request.query.status ? String(request.query.status) : null;
+  const priority = request.query.priority ? String(request.query.priority) : null;
+  const projectId = request.query.projectId ? String(request.query.projectId) : null;
+  const assigneeId = request.query.assigneeId ? String(request.query.assigneeId) : null;
+  const search = request.query.q ? String(request.query.q).trim().slice(0, 200) : null;
+  const due = request.query.due === 'overdue' ? 'overdue' : request.query.due === 'none' ? 'none' : null;
   const result = await query(
     `SELECT r.id, r.sequence_number AS "sequenceNumber", r.title, r.status, r.priority, r.updated_at AS "updatedAt", r.due_at AS "dueAt",
             p.id AS "projectId", p.name AS "projectName", u.display_name AS "reporterName", a.display_name AS "assigneeName",
@@ -353,12 +424,254 @@ app.get('/api/organizations/:organizationId/reports', async (request: AppRequest
      LEFT JOIN labels l ON l.id = rl.label_id
      WHERE r.organization_id = $1 AND r.deleted_at IS NULL
        AND ($2::bugflow_status IS NULL OR r.status = $2::bugflow_status)
-       AND ($3::boolean = true OR EXISTS (SELECT 1 FROM project_access pa WHERE pa.project_id = r.project_id AND pa.user_id = $4 AND pa.can_view = true))
+       AND ($3::bugflow_priority IS NULL OR r.priority = $3::bugflow_priority)
+       AND ($4::uuid IS NULL OR r.project_id = $4::uuid)
+       AND ($5::uuid IS NULL OR r.assignee_id = $5::uuid)
+       AND ($6::text IS NULL OR r.title ILIKE '%' || $6 || '%' OR r.description ILIKE '%' || $6 || '%')
+       AND ($7::text IS NULL OR ($7 = 'overdue' AND r.due_at < now() AND r.status NOT IN ('resolved', 'closed')) OR ($7 = 'none' AND r.due_at IS NULL))
+       AND ($8::boolean = true OR EXISTS (SELECT 1 FROM project_access pa WHERE pa.project_id = r.project_id AND pa.user_id = $9 AND pa.can_view = true))
      GROUP BY r.id, p.id, u.id, a.id
-     ORDER BY r.updated_at DESC`,
-    [organizationId, status, role === 'admin' || actor.isPlatformAdmin, actor.id],
+     ORDER BY CASE WHEN r.due_at IS NOT NULL AND r.status NOT IN ('resolved', 'closed') THEN 0 ELSE 1 END, r.due_at ASC NULLS LAST, r.updated_at DESC`,
+    [organizationId, status, priority, projectId, assigneeId, search, due, role === 'admin' || actor.isPlatformAdmin, actor.id],
   );
   response.json({ reports: result.rows });
+});
+
+/** Detail payload intentionally separates customer-visible activity from internal activity. */
+app.get('/api/reports/:reportId', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const reportId = routeParam(request.params.reportId);
+  const access = await reportAccess(actor, reportId, 'view');
+  if (!access.allowed || !access.report) return response.status(403).json({ error: 'You do not have access to this report.' });
+  const role = actor.isPlatformAdmin ? 'admin' : await organizationRole(actor.id, access.report.organization_id);
+  const report = await query(
+    `SELECT r.*, r.sequence_number AS "sequenceNumber", p.name AS "projectName", p.slug AS "projectSlug", u.display_name AS "reporterName", a.display_name AS "assigneeName"
+     FROM reports r JOIN projects p ON p.id = r.project_id JOIN users u ON u.id = r.reporter_id
+     LEFT JOIN users a ON a.id = r.assignee_id WHERE r.id = $1`, [reportId],
+  );
+  const comments = await query(
+    `SELECT c.id, c.body, c.visibility, c.created_at AS "createdAt", c.updated_at AS "updatedAt", u.display_name AS "authorName"
+     FROM report_comments c JOIN users u ON u.id = c.author_id
+     WHERE c.report_id = $1 AND c.deleted_at IS NULL AND ($2::boolean = true OR c.visibility = 'customer') ORDER BY c.created_at ASC`,
+    [reportId, role !== 'customer'],
+  );
+  const attachments = await query(
+    `SELECT id, original_filename AS "originalFilename", content_type AS "contentType", byte_size AS "byteSize", created_at AS "createdAt"
+     FROM attachments WHERE report_id = $1 ORDER BY created_at ASC`, [reportId],
+  );
+  const labels = await query(`SELECT l.id, l.name, l.color FROM report_labels rl JOIN labels l ON l.id = rl.label_id WHERE rl.report_id = $1 ORDER BY l.name`, [reportId]);
+  const duplicates = await query(
+    `SELECT r.id, r.sequence_number AS "sequenceNumber", r.title, r.status
+     FROM report_duplicates rd JOIN reports r ON r.id = rd.duplicate_of_report_id WHERE rd.report_id = $1 AND r.deleted_at IS NULL`, [reportId],
+  );
+  response.json({ report: report.rows[0], comments: comments.rows, attachments: attachments.rows, labels: labels.rows, duplicates: duplicates.rows });
+});
+
+app.patch('/api/reports/:reportId', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const reportId = routeParam(request.params.reportId);
+  const parsed = reportUpdateSchema.safeParse(request.body);
+  if (!parsed.success) return response.status(400).json({ error: 'Provide valid report fields.' });
+  const access = await reportAccess(actor, reportId, 'view');
+  if (!access.allowed || !access.report) return response.status(403).json({ error: 'You do not have access to this report.' });
+  const manage = await checkProjectAccess(actor, access.report.project_id, 'manage');
+  if (access.report.reporter_id !== actor.id && !manage.allowed) return response.status(403).json({ error: 'Only the reporter or a project manager can edit this report.' });
+  const columns: Array<[string, unknown]> = [];
+  const values = parsed.data;
+  if (values.title !== undefined) columns.push(['title', values.title]);
+  if (values.description !== undefined) columns.push(['description', values.description]);
+  if (values.reproductionSteps !== undefined) columns.push(['reproduction_steps', values.reproductionSteps]);
+  if (values.expectedResult !== undefined) columns.push(['expected_result', values.expectedResult]);
+  if (values.actualResult !== undefined) columns.push(['actual_result', values.actualResult]);
+  if (values.browserDevice !== undefined) columns.push(['browser_device', values.browserDevice]);
+  if (values.applicationVersion !== undefined) columns.push(['application_version', values.applicationVersion]);
+  if (values.priority !== undefined) columns.push(['priority', values.priority]);
+  if (values.dueAt !== undefined) columns.push(['due_at', values.dueAt]);
+  const assignments = columns.map(([column], index) => `${column} = $${index + 1}`).join(', ');
+  const updated = await query(`UPDATE reports SET ${assignments} WHERE id = $${columns.length + 1} RETURNING *`, [...columns.map(([, value]) => value), reportId]);
+  await writeAuditEvent({ organizationId: access.report.organization_id, actorId: actor.id, entityType: 'report', entityId: reportId, action: 'report_updated', metadata: { fields: columns.map(([column]) => column) }, ipAddress: clientIp(request) });
+  response.json(updated.rows[0]);
+});
+
+app.patch('/api/reports/:reportId/assignee', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const reportId = routeParam(request.params.reportId);
+  const parsed = assigneeSchema.safeParse(request.body);
+  if (!parsed.success) return response.status(400).json({ error: 'Provide a valid assignee.' });
+  const access = await reportAccess(actor, reportId, 'manage');
+  if (!access.allowed || !access.report) return response.status(403).json({ error: 'You do not have permission to assign this report.' });
+  if (parsed.data.assigneeId) {
+    const assignee = await query(`SELECT 1 FROM memberships WHERE organization_id = $1 AND user_id = $2 AND is_active = true AND role IN ('admin', 'team_member')`, [access.report.organization_id, parsed.data.assigneeId]);
+    if (!assignee.rowCount) return response.status(400).json({ error: 'The assignee must be an active administrator or team member in this organization.' });
+  }
+  const updated = await query('UPDATE reports SET assignee_id = $1 WHERE id = $2 RETURNING *', [parsed.data.assigneeId, reportId]);
+  await writeAuditEvent({ organizationId: access.report.organization_id, actorId: actor.id, entityType: 'report', entityId: reportId, action: 'assignee_changed', metadata: { assigneeId: parsed.data.assigneeId }, ipAddress: clientIp(request) });
+  if (parsed.data.assigneeId && parsed.data.assigneeId !== actor.id) {
+    await query(`INSERT INTO notifications (organization_id, user_id, report_id, type, title, body) VALUES ($1, $2, $3, 'assignment', 'A report was assigned to you', 'Open the report to review its priority and due date.')`, [access.report.organization_id, parsed.data.assigneeId, reportId]);
+  }
+  response.json(updated.rows[0]);
+});
+
+app.get('/api/organizations/:organizationId/labels', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const organizationId = routeParam(request.params.organizationId);
+  const role = actor.isPlatformAdmin ? 'admin' : await organizationRole(actor.id, organizationId);
+  if (!role) return response.status(403).json({ error: 'You do not have access to this organization.' });
+  const labels = await query('SELECT id, name, color, created_at AS "createdAt" FROM labels WHERE organization_id = $1 ORDER BY name', [organizationId]);
+  response.json({ labels: labels.rows });
+});
+
+app.post('/api/organizations/:organizationId/labels', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const organizationId = routeParam(request.params.organizationId);
+  const role = actor.isPlatformAdmin ? 'admin' : await organizationRole(actor.id, organizationId);
+  if (role !== 'admin') return response.status(403).json({ error: 'Organization administrator access is required.' });
+  const parsed = labelSchema.safeParse(request.body);
+  if (!parsed.success) return response.status(400).json({ error: 'Provide a valid label name and color.' });
+  try {
+    const label = await query('INSERT INTO labels (organization_id, name, color) VALUES ($1, $2, $3) RETURNING *', [organizationId, parsed.data.name, parsed.data.color]);
+    await writeAuditEvent({ organizationId, actorId: actor.id, entityType: 'label', entityId: label.rows[0].id, action: 'label_created', metadata: parsed.data, ipAddress: clientIp(request) });
+    response.status(201).json(label.rows[0]);
+  } catch { response.status(409).json({ error: 'A label with that name already exists.' }); }
+});
+
+app.patch('/api/organizations/:organizationId/labels/:labelId', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const organizationId = routeParam(request.params.organizationId);
+  const role = actor.isPlatformAdmin ? 'admin' : await organizationRole(actor.id, organizationId);
+  if (role !== 'admin') return response.status(403).json({ error: 'Organization administrator access is required.' });
+  const parsed = labelSchema.safeParse(request.body);
+  if (!parsed.success) return response.status(400).json({ error: 'Provide a valid label name and color.' });
+  const updated = await query('UPDATE labels SET name = $1, color = $2 WHERE id = $3 AND organization_id = $4 RETURNING *', [parsed.data.name, parsed.data.color, routeParam(request.params.labelId), organizationId]);
+  if (!updated.rowCount) return response.status(404).json({ error: 'Label not found.' });
+  response.json(updated.rows[0]);
+});
+
+app.delete('/api/organizations/:organizationId/labels/:labelId', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const organizationId = routeParam(request.params.organizationId);
+  const role = actor.isPlatformAdmin ? 'admin' : await organizationRole(actor.id, organizationId);
+  if (role !== 'admin') return response.status(403).json({ error: 'Organization administrator access is required.' });
+  const removed = await query('DELETE FROM labels WHERE id = $1 AND organization_id = $2 RETURNING id', [routeParam(request.params.labelId), organizationId]);
+  if (!removed.rowCount) return response.status(404).json({ error: 'Label not found.' });
+  response.status(204).end();
+});
+
+app.post('/api/reports/:reportId/labels', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const reportId = routeParam(request.params.reportId);
+  const parsed = reportLabelSchema.safeParse(request.body);
+  if (!parsed.success) return response.status(400).json({ error: 'Provide a valid label.' });
+  const access = await reportAccess(actor, reportId, 'manage');
+  if (!access.allowed || !access.report) return response.status(403).json({ error: 'You do not have permission to label this report.' });
+  const label = await query('SELECT id FROM labels WHERE id = $1 AND organization_id = $2', [parsed.data.labelId, access.report.organization_id]);
+  if (!label.rowCount) return response.status(400).json({ error: 'The label does not belong to this organization.' });
+  await query('INSERT INTO report_labels (report_id, label_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [reportId, parsed.data.labelId]);
+  await writeAuditEvent({ organizationId: access.report.organization_id, actorId: actor.id, entityType: 'report_label', entityId: reportId, action: 'report_labeled', metadata: { labelId: parsed.data.labelId }, ipAddress: clientIp(request) });
+  response.status(201).json({ reportId, labelId: parsed.data.labelId });
+});
+
+app.delete('/api/reports/:reportId/labels/:labelId', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const reportId = routeParam(request.params.reportId);
+  const access = await reportAccess(actor, reportId, 'manage');
+  if (!access.allowed || !access.report) return response.status(403).json({ error: 'You do not have permission to edit labels on this report.' });
+  await query('DELETE FROM report_labels WHERE report_id = $1 AND label_id = $2', [reportId, routeParam(request.params.labelId)]);
+  response.status(204).end();
+});
+
+app.post('/api/reports/:reportId/duplicates', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const reportId = routeParam(request.params.reportId);
+  const parsed = duplicateSchema.safeParse(request.body);
+  if (!parsed.success || parsed.data.duplicateOfId === reportId) return response.status(400).json({ error: 'Provide a different valid duplicate report.' });
+  const access = await reportAccess(actor, reportId, 'manage');
+  if (!access.allowed || !access.report) return response.status(403).json({ error: 'You do not have permission to link duplicates.' });
+  const duplicate = await query('SELECT id FROM reports WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL', [parsed.data.duplicateOfId, access.report.organization_id]);
+  if (!duplicate.rowCount) return response.status(400).json({ error: 'Duplicate reports must belong to the same organization.' });
+  await query('INSERT INTO report_duplicates (report_id, duplicate_of_report_id, created_by) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING', [reportId, parsed.data.duplicateOfId, actor.id]);
+  await writeAuditEvent({ organizationId: access.report.organization_id, actorId: actor.id, entityType: 'report_duplicate', entityId: reportId, action: 'duplicate_linked', metadata: { duplicateOfId: parsed.data.duplicateOfId }, ipAddress: clientIp(request) });
+  response.status(201).json({ reportId, duplicateOfId: parsed.data.duplicateOfId });
+});
+
+app.delete('/api/reports/:reportId/duplicates/:duplicateOfId', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const reportId = routeParam(request.params.reportId);
+  const access = await reportAccess(actor, reportId, 'manage');
+  if (!access.allowed || !access.report) return response.status(403).json({ error: 'You do not have permission to unlink duplicates.' });
+  await query('DELETE FROM report_duplicates WHERE report_id = $1 AND duplicate_of_report_id = $2', [reportId, routeParam(request.params.duplicateOfId)]);
+  response.status(204).end();
+});
+
+app.get('/api/organizations/:organizationId/users', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const organizationId = routeParam(request.params.organizationId);
+  const role = actor.isPlatformAdmin ? 'admin' : await organizationRole(actor.id, organizationId);
+  if (role !== 'admin') return response.status(403).json({ error: 'Organization administrator access is required.' });
+  const users = await query(`SELECT u.id, u.username, u.email, u.display_name AS "displayName", u.is_active AS "isActive", m.role FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.organization_id = $1 ORDER BY u.display_name`, [organizationId]);
+  response.json({ users: users.rows });
+});
+
+async function changeUserState(request: AppRequest, response: Response, active: boolean) {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const organizationId = routeParam(request.params.organizationId);
+  const userId = routeParam(request.params.userId);
+  const role = actor.isPlatformAdmin ? 'admin' : await organizationRole(actor.id, organizationId);
+  if (role !== 'admin') return response.status(403).json({ error: 'Organization administrator access is required.' });
+  if (!active && userId === actor.id) return response.status(400).json({ error: 'Administrators cannot deactivate their own account.' });
+  const membership = await query('SELECT 1 FROM memberships WHERE organization_id = $1 AND user_id = $2', [organizationId, userId]);
+  if (!membership.rowCount) return response.status(404).json({ error: 'User is not a member of this organization.' });
+  await withTransaction(async (client) => {
+    await client.query('UPDATE users SET is_active = $1 WHERE id = $2', [active, userId]);
+    await client.query('UPDATE memberships SET is_active = $1 WHERE organization_id = $2 AND user_id = $3', [active, organizationId, userId]);
+    if (!active) await client.query('DELETE FROM sessions WHERE user_id = $1', [userId]);
+  });
+  await writeAuditEvent({ organizationId, actorId: actor.id, entityType: 'user', entityId: userId, action: active ? 'user_activated' : 'user_deactivated', ipAddress: clientIp(request) });
+  response.json({ userId, isActive: active });
+}
+app.post('/api/organizations/:organizationId/users/:userId/deactivate', (request: AppRequest, response) => changeUserState(request, response, false));
+app.post('/api/organizations/:organizationId/users/:userId/activate', (request: AppRequest, response) => changeUserState(request, response, true));
+
+app.get('/api/organizations/:organizationId/audit', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const organizationId = routeParam(request.params.organizationId);
+  const role = actor.isPlatformAdmin ? 'admin' : await organizationRole(actor.id, organizationId);
+  if (role !== 'admin') return response.status(403).json({ error: 'Organization administrator access is required.' });
+  const events = await query(`SELECT e.id, e.action, e.entity_type AS "entityType", e.entity_id AS "entityId", e.metadata, e.created_at AS "createdAt", u.display_name AS "actorName" FROM audit_events e LEFT JOIN users u ON u.id = e.actor_id WHERE e.organization_id = $1 ORDER BY e.created_at DESC LIMIT 200`, [organizationId]);
+  response.json({ events: events.rows });
+});
+
+app.get('/api/notifications', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const notifications = await query(
+    `SELECT n.id, n.type, n.title, n.body, n.read_at AS "readAt", n.created_at AS "createdAt", r.sequence_number AS "sequenceNumber", r.title AS "reportTitle"
+     FROM notifications n LEFT JOIN reports r ON r.id = n.report_id WHERE n.user_id = $1 ORDER BY n.created_at DESC LIMIT 100`,
+    [actor.id],
+  );
+  response.json({ notifications: notifications.rows });
+});
+
+app.patch('/api/notifications/:notificationId/read', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const notification = await query('UPDATE notifications SET read_at = COALESCE(read_at, now()) WHERE id = $1 AND user_id = $2 RETURNING id, read_at AS "readAt"', [routeParam(request.params.notificationId), actor.id]);
+  if (!notification.rowCount) return response.status(404).json({ error: 'Notification not found.' });
+  response.json(notification.rows[0]);
 });
 
 app.post('/api/reports', async (request: AppRequest, response) => {
@@ -399,6 +712,7 @@ app.post('/api/reports/:reportId/comments', async (request: AppRequest, response
 
   const result = await query('INSERT INTO report_comments (report_id, author_id, body, visibility) VALUES ($1, $2, $3, $4) RETURNING *', [reportId, actor.id, parsed.data.body, parsed.data.visibility]);
   await writeAuditEvent({ organizationId: access.report.organization_id, actorId: actor.id, entityType: 'report_comment', entityId: result.rows[0].id, action: parsed.data.visibility === 'internal' ? 'internal_comment_created' : 'customer_comment_created', metadata: { reportId }, ipAddress: clientIp(request) });
+  if (parsed.data.visibility === 'customer') await notifyReporterOfVisibleUpdate({ reportId, actorId: actor.id, type: 'customer_comment', update: 'A new customer-visible comment was added.' });
   response.status(201).json(result.rows[0]);
 });
 
@@ -477,6 +791,7 @@ app.patch('/api/reports/:reportId/status', async (request: AppRequest, response)
   if (!access.allowed || !access.report) return response.status(403).json({ error: 'You do not have permission to change this report.' });
   const updated = await query('UPDATE reports SET status = $1 WHERE id = $2 RETURNING *', [parsed.data.status, reportId]);
   await writeAuditEvent({ organizationId: access.report.organization_id, actorId: actor.id, entityType: 'report', entityId: reportId, action: 'status_changed', metadata: { status: parsed.data.status }, ipAddress: clientIp(request) });
+  await notifyReporterOfVisibleUpdate({ reportId, actorId: actor.id, type: 'status_changed', update: `Status changed to ${parsed.data.status.replace('_', ' ')}.` });
   response.json(updated.rows[0]);
 });
 
@@ -488,6 +803,9 @@ app.use((error: unknown, _request: Request, response: Response, _next: NextFunct
 
 const clientDirectory = path.resolve(process.cwd(), 'dist');
 const indexHtml = path.join(clientDirectory, 'index.html');
+
+// API misses must stay JSON responses; otherwise the SPA fallback can disguise a missing workflow as HTTP 200.
+app.use('/api', (_request, response) => response.status(404).json({ error: 'API route not found.' }));
 if (existsSync(indexHtml)) {
   app.use(express.static(clientDirectory, { index: false, maxAge: '1h' }));
   app.use((_request, response) => response.sendFile(indexHtml));
