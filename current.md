@@ -103,3 +103,40 @@ _New failures will be added immediately and marked fixed only after a successful
 | QA-006 | Report detail activity UI | Activity form navigated natively because it was nested inside the report-edit form. | Invalid nested HTML forms caused browser submission behavior to bypass the intended asynchronous handler. | Separated the report-edit and activity forms; build and lint pass. | Pending controlled deploy and UI retest |
 | QA-007 | Report detail activity UI | After separating forms, posting an update raised `Cannot read properties of null (reading 'reset')` and did not refresh activity. | The asynchronous handler accessed React’s `event.currentTarget` after an awaited API call, when the event target was no longer available. | Pending capture of the form element before awaiting the API call. | Pending |
 | QA-007 | Report detail activity UI | Comment submission attempted to reset a null event target after the API call. | React event target was accessed after an await. | Captured the form element before awaiting and reset that retained element; build and lint pass. | Pending controlled deploy and UI retest |
+
+
+## Live UI retest — 2026-08-14
+
+**Result:** Passed. The controlled QA report now displays `BF-1` consistently in the list, drawer header, and detail breadcrumb. The customer-visible activity form remains in the drawer, clears after submission, and appends the new update to the live activity timeline without navigation or error.
+
+**Fixed defects:** QA-005, QA-006, and QA-007 are verified fixed in the deployed `feature/linear-workflow-qa` branch.
+
+
+## Final production regression — 2026-08-14
+
+**Result:** **49/49 checks passed; 0 failed.** This final isolated production run followed the live UI report-code and activity-form retests. All supported API workflows remain healthy with PostgreSQL and private attachment storage ready.
+
+**Email note:** Password-reset and customer email delivery are intentionally reported as unavailable until Railway receives a Resend API key and a verified sender identity. The application returns an explicit HTTP 503 instead of falsely claiming an email was sent.
+
+
+## v0.4.0 expansion plan — 2026-08-14
+
+**Approved scope:** Build priorities 1–4: Resend email delivery configuration, an administrator workspace, triage productivity improvements, customer portal enhancements, and an administrator-managed backup service.
+
+**Backup architecture selected:** **Managed backup service.** A short-lived Railway job will perform one-time and recurring logical PostgreSQL exports, place private archives in the existing Railway bucket, and record status/history in BugFlow. The application will expose global administrator controls for one-time, weekly, and monthly backup policies. Recurrence will be evaluated by the worker so administrators can change policy without directly editing Railway’s cron configuration.
+
+**Delivery prerequisite:** External email cannot be live-tested until the Railway environment contains a Resend API key and verified sender identity. Product behavior will continue to return explicit configuration errors until those values are present.
+
+
+### v0.4.0 implementation cycle 1
+
+**Completed:** Added versioned schema support for backup policy/history, saved views, report subscriptions, and release notes; created the private Railway backup worker and archive helper; added platform backup policy/history/manual-run APIs; added saved-view, bulk triage, subscription, duplicate-suggestion, and release-note APIs.
+
+**Validation:** `pnpm build && pnpm lint` passed after correcting the Zod v4 saved-view record schema.
+
+
+### Backup design references
+
+- Railway PostgreSQL guidance recommends regular backups: https://docs.railway.com/databases/postgresql
+- Railway cron jobs are suitable for short-lived tasks such as database backups and use UTC schedules: https://docs.railway.com/cron-jobs
+- Railway native volume backups provide manual, weekly, and monthly snapshots, but the selected BugFlow-managed service controls logical export scheduling inside the product: https://docs.railway.com/volumes/backups

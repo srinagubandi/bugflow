@@ -94,6 +94,16 @@ function requireUser(request: AppRequest, response: Response): CurrentUser | nul
   return request.currentUser;
 }
 
+function requirePlatformAdmin(request: AppRequest, response: Response): CurrentUser | null {
+  const user = requireUser(request, response);
+  if (!user) return null;
+  if (!user.isPlatformAdmin) {
+    response.status(403).json({ error: 'Platform administrator access is required.' });
+    return null;
+  }
+  return user;
+}
+
 async function organizationRole(userId: string, organizationId: string) {
   const result = await query<{ role: 'admin' | 'team_member' | 'customer' }>(
     `SELECT role FROM memberships WHERE user_id = $1 AND organization_id = $2 AND is_active = true`,
@@ -185,6 +195,16 @@ const assigneeSchema = z.object({ assigneeId: z.string().uuid().nullable() });
 const labelSchema = z.object({ name: z.string().min(1).max(60), color: z.string().regex(/^#[0-9a-fA-F]{6}$/).default('#6750A4') });
 const reportLabelSchema = z.object({ labelId: z.string().uuid() });
 const duplicateSchema = z.object({ duplicateOfId: z.string().uuid() });
+const backupSettingsSchema = z.object({
+  enabled: z.boolean(),
+  frequency: z.enum(['manual', 'weekly', 'monthly']),
+  dayOfWeek: z.number().int().min(0).max(6).default(0),
+  dayOfMonth: z.number().int().min(1).max(28).default(1),
+  hourUtc: z.number().int().min(0).max(23).default(3),
+});
+const savedViewSchema = z.object({ name: z.string().min(1).max(80), filters: z.record(z.string(), z.unknown()).default({}), isShared: z.boolean().default(false) });
+const bulkReportSchema = z.object({ reportIds: z.array(z.string().uuid()).min(1).max(100), status: z.enum(['new', 'acknowledged', 'in_progress', 'resolved', 'closed']).optional(), assigneeId: z.string().uuid().nullable().optional() }).refine((value) => value.status !== undefined || value.assigneeId !== undefined, 'Choose a bulk update.');
+const releaseNoteSchema = z.object({ projectId: z.string().uuid().nullable().optional(), title: z.string().min(3).max(180), body: z.string().min(3).max(20000), version: z.string().max(80).nullable().optional(), publish: z.boolean().default(false) });
 
 app.get('/api/health', (_request, response) => {
   response.json({ status: 'ok', service: 'bugflow', storageConfigured: storageIsConfigured(), timestamp: new Date().toISOString() });
@@ -793,6 +813,183 @@ app.patch('/api/reports/:reportId/status', async (request: AppRequest, response)
   await writeAuditEvent({ organizationId: access.report.organization_id, actorId: actor.id, entityType: 'report', entityId: reportId, action: 'status_changed', metadata: { status: parsed.data.status }, ipAddress: clientIp(request) });
   await notifyReporterOfVisibleUpdate({ reportId, actorId: actor.id, type: 'status_changed', update: `Status changed to ${parsed.data.status.replace('_', ' ')}.` });
   response.json(updated.rows[0]);
+});
+
+app.get('/api/platform/settings', async (request: AppRequest, response) => {
+  const actor = requirePlatformAdmin(request, response);
+  if (!actor) return;
+  const settings = await query(`SELECT backup_frequency AS "backupFrequency", backup_enabled AS "backupEnabled", backup_day_of_week AS "backupDayOfWeek", backup_day_of_month AS "backupDayOfMonth", backup_hour_utc AS "backupHourUtc", last_backup_requested_at AS "lastBackupRequestedAt", updated_at AS "updatedAt" FROM platform_settings WHERE id = true`);
+  response.json({ settings: settings.rows[0] ?? null, email: { configured: Boolean(process.env.RESEND_API_KEY && process.env.RESEND_FROM_EMAIL), from: process.env.RESEND_FROM_EMAIL ?? null, appUrl: process.env.APP_URL ?? null } });
+});
+
+app.patch('/api/platform/settings/backups', async (request: AppRequest, response) => {
+  const actor = requirePlatformAdmin(request, response);
+  if (!actor) return;
+  const parsed = backupSettingsSchema.safeParse(request.body);
+  if (!parsed.success) return response.status(400).json({ error: 'Provide a valid backup frequency and UTC schedule.' });
+  const settings = await query(
+    `UPDATE platform_settings SET backup_frequency = $1, backup_enabled = $2, backup_day_of_week = $3, backup_day_of_month = $4, backup_hour_utc = $5, updated_by = $6
+     WHERE id = true RETURNING backup_frequency AS "backupFrequency", backup_enabled AS "backupEnabled", backup_day_of_week AS "backupDayOfWeek", backup_day_of_month AS "backupDayOfMonth", backup_hour_utc AS "backupHourUtc", updated_at AS "updatedAt"`,
+    [parsed.data.frequency, parsed.data.enabled, parsed.data.dayOfWeek, parsed.data.dayOfMonth, parsed.data.hourUtc, actor.id],
+  );
+  await writeAuditEvent({ actorId: actor.id, entityType: 'backup_policy', action: 'backup_policy_updated', metadata: parsed.data, ipAddress: clientIp(request) });
+  response.json({ settings: settings.rows[0] });
+});
+
+app.get('/api/platform/backups', async (request: AppRequest, response) => {
+  const actor = requirePlatformAdmin(request, response);
+  if (!actor) return;
+  const runs = await query(`SELECT id, status, trigger, storage_key AS "storageKey", byte_size AS "byteSize", checksum, requested_by AS "requestedBy", started_at AS "startedAt", completed_at AS "completedAt", error_message AS "errorMessage", created_at AS "createdAt" FROM backup_runs ORDER BY created_at DESC LIMIT 50`);
+  response.json({ runs: runs.rows });
+});
+
+app.post('/api/platform/backups', async (request: AppRequest, response) => {
+  const actor = requirePlatformAdmin(request, response);
+  if (!actor) return;
+  if (!storageIsConfigured()) return response.status(503).json({ error: 'Private Railway object storage is required before backups can run.' });
+  const active = await query(`SELECT id FROM backup_runs WHERE status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1`);
+  if (active.rowCount) return response.status(409).json({ error: 'A backup is already queued or running.' });
+  const run = await query(`INSERT INTO backup_runs (status, trigger, requested_by) VALUES ('queued', 'manual', $1) RETURNING id, status, trigger, created_at AS "createdAt"`, [actor.id]);
+  await query('UPDATE platform_settings SET last_backup_requested_at = now(), updated_by = $1 WHERE id = true', [actor.id]);
+  await writeAuditEvent({ actorId: actor.id, entityType: 'backup_run', entityId: run.rows[0].id, action: 'backup_requested', metadata: { trigger: 'manual' }, ipAddress: clientIp(request) });
+  response.status(202).json({ run: run.rows[0], message: 'Backup queued. The Railway backup job will process it on its next run.' });
+});
+
+app.get('/api/organizations/:organizationId/views', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const organizationId = routeParam(request.params.organizationId);
+  const role = actor.isPlatformAdmin ? 'admin' : await organizationRole(actor.id, organizationId);
+  if (!role) return response.status(403).json({ error: 'You do not have access to this organization.' });
+  const views = await query(`SELECT id, name, filters, is_shared AS "isShared", owner_id AS "ownerId", created_at AS "createdAt", updated_at AS "updatedAt" FROM saved_views WHERE organization_id = $1 AND (owner_id = $2 OR is_shared = true OR $3::boolean = true) ORDER BY is_shared DESC, name`, [organizationId, actor.id, role === 'admin' || actor.isPlatformAdmin]);
+  response.json({ views: views.rows });
+});
+
+app.post('/api/organizations/:organizationId/views', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const organizationId = routeParam(request.params.organizationId);
+  const role = actor.isPlatformAdmin ? 'admin' : await organizationRole(actor.id, organizationId);
+  if (!role) return response.status(403).json({ error: 'You do not have access to this organization.' });
+  const parsed = savedViewSchema.safeParse(request.body);
+  if (!parsed.success) return response.status(400).json({ error: 'Provide a name and valid filters.' });
+  if (parsed.data.isShared && role !== 'admin' && !actor.isPlatformAdmin) return response.status(403).json({ error: 'Only administrators can create shared views.' });
+  try {
+    const created = await query(`INSERT INTO saved_views (organization_id, owner_id, name, filters, is_shared) VALUES ($1, $2, $3, $4::jsonb, $5) RETURNING id, name, filters, is_shared AS "isShared", owner_id AS "ownerId", created_at AS "createdAt"`, [organizationId, actor.id, parsed.data.name, JSON.stringify(parsed.data.filters), parsed.data.isShared]);
+    response.status(201).json({ view: created.rows[0] });
+  } catch { response.status(409).json({ error: 'You already have a view with that name.' }); }
+});
+
+app.delete('/api/organizations/:organizationId/views/:viewId', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const organizationId = routeParam(request.params.organizationId);
+  const role = actor.isPlatformAdmin ? 'admin' : await organizationRole(actor.id, organizationId);
+  if (!role) return response.status(403).json({ error: 'You do not have access to this organization.' });
+  const removed = await query(`DELETE FROM saved_views WHERE id = $1 AND organization_id = $2 AND (owner_id = $3 OR $4::boolean = true) RETURNING id`, [routeParam(request.params.viewId), organizationId, actor.id, role === 'admin' || actor.isPlatformAdmin]);
+  if (!removed.rowCount) return response.status(404).json({ error: 'Saved view not found.' });
+  response.status(204).end();
+});
+
+app.patch('/api/organizations/:organizationId/reports/bulk', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const organizationId = routeParam(request.params.organizationId);
+  const parsed = bulkReportSchema.safeParse(request.body);
+  if (!parsed.success) return response.status(400).json({ error: 'Provide one to one hundred reports and a bulk update.' });
+  const role = actor.isPlatformAdmin ? 'admin' : await organizationRole(actor.id, organizationId);
+  if (!role) return response.status(403).json({ error: 'You do not have access to this organization.' });
+  const reports = await query<{ id: string; project_id: string }>('SELECT id, project_id FROM reports WHERE organization_id = $1 AND id = ANY($2::uuid[]) AND deleted_at IS NULL', [organizationId, parsed.data.reportIds]);
+  if (reports.rowCount !== parsed.data.reportIds.length) return response.status(404).json({ error: 'One or more reports were not found.' });
+  for (const report of reports.rows) {
+    const access = await checkProjectAccess(actor, report.project_id, 'manage');
+    if (!access.allowed) return response.status(403).json({ error: 'You do not have permission to bulk-update every selected report.' });
+  }
+  const hasAssignee = Object.prototype.hasOwnProperty.call(parsed.data, 'assigneeId');
+  if (hasAssignee && parsed.data.assigneeId) {
+    const member = await query(`SELECT 1 FROM memberships WHERE organization_id = $1 AND user_id = $2 AND is_active = true AND role IN ('admin', 'team_member')`, [organizationId, parsed.data.assigneeId]);
+    if (!member.rowCount) return response.status(400).json({ error: 'The assignee must be an active administrator or team member.' });
+  }
+  const updated = await query(`UPDATE reports SET status = COALESCE($1::bugflow_status, status), assignee_id = CASE WHEN $2::boolean THEN $3::uuid ELSE assignee_id END WHERE id = ANY($4::uuid[]) RETURNING id, status, assignee_id AS "assigneeId"`, [parsed.data.status ?? null, hasAssignee, parsed.data.assigneeId ?? null, parsed.data.reportIds]);
+  await writeAuditEvent({ organizationId, actorId: actor.id, entityType: 'report', action: 'reports_bulk_updated', metadata: { reportIds: parsed.data.reportIds, status: parsed.data.status, assigneeId: parsed.data.assigneeId }, ipAddress: clientIp(request) });
+  response.json({ reports: updated.rows });
+});
+
+app.get('/api/reports/:reportId/subscription', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const access = await reportAccess(actor, routeParam(request.params.reportId), 'view');
+  if (!access.allowed) return response.status(403).json({ error: 'You do not have access to this report.' });
+  const subscription = await query('SELECT 1 FROM report_subscriptions WHERE report_id = $1 AND user_id = $2', [routeParam(request.params.reportId), actor.id]);
+  response.json({ subscribed: Boolean(subscription.rowCount) });
+});
+
+app.post('/api/reports/:reportId/subscription', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const reportId = routeParam(request.params.reportId);
+  const access = await reportAccess(actor, reportId, 'view');
+  if (!access.allowed) return response.status(403).json({ error: 'You do not have access to this report.' });
+  await query('INSERT INTO report_subscriptions (report_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [reportId, actor.id]);
+  response.status(201).json({ subscribed: true });
+});
+
+app.delete('/api/reports/:reportId/subscription', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const reportId = routeParam(request.params.reportId);
+  const access = await reportAccess(actor, reportId, 'view');
+  if (!access.allowed) return response.status(403).json({ error: 'You do not have access to this report.' });
+  await query('DELETE FROM report_subscriptions WHERE report_id = $1 AND user_id = $2', [reportId, actor.id]);
+  response.status(204).end();
+});
+
+app.get('/api/reports/:reportId/duplicate-suggestions', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const reportId = routeParam(request.params.reportId);
+  const access = await reportAccess(actor, reportId, 'view');
+  if (!access.allowed || !access.report) return response.status(403).json({ error: 'You do not have access to this report.' });
+  const matches = await query(`SELECT candidate.id, candidate.sequence_number AS "sequenceNumber", candidate.title, candidate.status, candidate.priority FROM reports source JOIN reports candidate ON candidate.organization_id = source.organization_id WHERE source.id = $1 AND candidate.id <> source.id AND candidate.deleted_at IS NULL AND (candidate.title ILIKE '%' || split_part(source.title, ' ', 1) || '%' OR source.title ILIKE '%' || split_part(candidate.title, ' ', 1) || '%') ORDER BY candidate.updated_at DESC LIMIT 8`, [reportId]);
+  response.json({ suggestions: matches.rows });
+});
+
+app.get('/api/organizations/:organizationId/release-notes', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const organizationId = routeParam(request.params.organizationId);
+  const role = actor.isPlatformAdmin ? 'admin' : await organizationRole(actor.id, organizationId);
+  if (!role) return response.status(403).json({ error: 'You do not have access to this organization.' });
+  const notes = await query(`SELECT id, project_id AS "projectId", title, body, version, published_at AS "publishedAt", created_at AS "createdAt" FROM release_notes WHERE organization_id = $1 AND ($2::boolean = true OR published_at IS NOT NULL) ORDER BY published_at DESC NULLS LAST, created_at DESC`, [organizationId, role === 'admin' || actor.isPlatformAdmin]);
+  response.json({ releaseNotes: notes.rows });
+});
+
+app.post('/api/organizations/:organizationId/release-notes', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const organizationId = routeParam(request.params.organizationId);
+  const role = actor.isPlatformAdmin ? 'admin' : await organizationRole(actor.id, organizationId);
+  if (role !== 'admin') return response.status(403).json({ error: 'Organization administrator access is required.' });
+  const parsed = releaseNoteSchema.safeParse(request.body);
+  if (!parsed.success) return response.status(400).json({ error: 'Provide valid release-note content.' });
+  if (parsed.data.projectId) {
+    const project = await query('SELECT 1 FROM projects WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL', [parsed.data.projectId, organizationId]);
+    if (!project.rowCount) return response.status(400).json({ error: 'The selected project does not belong to this organization.' });
+  }
+  const note = await query(`INSERT INTO release_notes (organization_id, project_id, title, body, version, published_at, created_by) VALUES ($1, $2, $3, $4, $5, CASE WHEN $6 THEN now() ELSE NULL END, $7) RETURNING id, project_id AS "projectId", title, body, version, published_at AS "publishedAt", created_at AS "createdAt"`, [organizationId, parsed.data.projectId ?? null, parsed.data.title, parsed.data.body, parsed.data.version ?? null, parsed.data.publish, actor.id]);
+  await writeAuditEvent({ organizationId, actorId: actor.id, entityType: 'release_note', entityId: note.rows[0].id, action: parsed.data.publish ? 'release_note_published' : 'release_note_drafted', ipAddress: clientIp(request) });
+  response.status(201).json({ releaseNote: note.rows[0] });
+});
+
+app.post('/api/organizations/:organizationId/release-notes/:noteId/publish', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const organizationId = routeParam(request.params.organizationId);
+  const role = actor.isPlatformAdmin ? 'admin' : await organizationRole(actor.id, organizationId);
+  if (role !== 'admin') return response.status(403).json({ error: 'Organization administrator access is required.' });
+  const note = await query(`UPDATE release_notes SET published_at = now() WHERE id = $1 AND organization_id = $2 RETURNING id, published_at AS "publishedAt"`, [routeParam(request.params.noteId), organizationId]);
+  if (!note.rowCount) return response.status(404).json({ error: 'Release note not found.' });
+  response.json({ releaseNote: note.rows[0] });
 });
 
 app.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => {
