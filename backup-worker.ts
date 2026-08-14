@@ -20,11 +20,37 @@ function isDue(settings: Settings, now: Date) {
 
 function runPgDump(databaseUrl: string, target: string) {
   return new Promise<void>((resolve, reject) => {
-    const command = spawn('pg_dump', [databaseUrl, '--format=custom', '--file', target, '--no-owner', '--no-acl'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const source = new URL(databaseUrl);
+    const username = decodeURIComponent(source.username);
+    const password = decodeURIComponent(source.password);
+    const database = source.pathname.replace(/^\//, '');
+    const sslMode = source.searchParams.get('sslmode') ?? process.env.PGSSLMODE ?? 'disable';
+    const command = spawn(
+      'pg_dump',
+      [
+        '--host', source.hostname,
+        '--port', source.port || '5432',
+        '--username', username,
+        '--dbname', database,
+        '--format=custom',
+        '--file', target,
+        '--no-owner',
+        '--no-acl',
+      ],
+      {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, PGPASSWORD: password, PGSSLMODE: sslMode },
+      },
+    );
     let stderr = '';
+    const timeout = setTimeout(() => command.kill('SIGTERM'), 90_000);
     command.stderr.on('data', (value) => { stderr += String(value); });
-    command.on('error', reject);
-    command.on('close', (code) => code === 0 ? resolve() : reject(new Error(stderr.trim() || `pg_dump exited with ${code}`)));
+    command.on('error', (error) => { clearTimeout(timeout); reject(error); });
+    command.on('close', (code, signal) => {
+      clearTimeout(timeout);
+      if (code === 0) resolve();
+      else reject(new Error(stderr.trim() || (signal ? `pg_dump terminated by ${signal}` : `pg_dump exited with ${code}`)));
+    });
   });
 }
 
