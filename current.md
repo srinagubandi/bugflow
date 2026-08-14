@@ -140,3 +140,48 @@ _New failures will be added immediately and marked fixed only after a successful
 - Railway PostgreSQL guidance recommends regular backups: https://docs.railway.com/databases/postgresql
 - Railway cron jobs are suitable for short-lived tasks such as database backups and use UTC schedules: https://docs.railway.com/cron-jobs
 - Railway native volume backups provide manual, weekly, and monthly snapshots, but the selected BugFlow-managed service controls logical export scheduling inside the product: https://docs.railway.com/volumes/backups
+
+
+## Railway backup-worker deployment reference — 2026-08-14
+
+- The `feature/admin-backups-portal` branch includes `railway.backup.toml`, a Dockerfile-backed Railway cron configuration for the managed backup worker.
+- Railway configuration reference: https://docs.railway.com/config-as-code/reference
+- Railway cron-service reference: https://docs.railway.com/cron-jobs
+- The worker is configured on a 15-minute UTC cron tick. It exits after evaluating the policy; the application determines whether a pending one-time, weekly, or monthly backup is due.
+- The backup worker receives only its `DATABASE_URL` and the private object-storage references `BUCKET`, `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY`, `ENDPOINT`, `REGION=auto`, and `S3_FORCE_PATH_STYLE=false`. No public networking is configured.
+
+
+### v0.4.0 backup-worker runtime validation
+
+- **Failure observed:** The Railway backup-worker image deployed successfully after adding the trusted pnpm build approval, but the first manually triggered cron execution started a container and then crashed after roughly one minute without producing a worker log line.
+- **Likely root cause under investigation:** the logical dump process may be waiting for PostgreSQL authentication rather than receiving the Railway connection credential in a form `pg_dump` uses non-interactively.
+- **Next fix:** parse the Railway connection URL, pass explicit host, port, username, database name, password, and SSL mode to `pg_dump`, and add a bounded timeout/error path before retesting the one-time archive workflow.
+
+- **Fix applied:** The worker now parses `DATABASE_URL`, supplies `PGPASSWORD`, host, port, username, database name, and explicit SSL mode to `pg_dump`, and terminates a stalled dump after 90 seconds with a diagnostic error.
+- **Local validation:** `pnpm build && pnpm lint` passed after the worker change. The focused worker retest is ready for deployment.
+
+## Managed backup worker runtime defect — 2026-08-14
+
+| ID | Area | Failure | Root cause | Fix | Retest status |
+|---|---|---|---|---|---|
+| QA-008 | Managed backup worker | A manually triggered one-time backup was claimed but failed before archive upload. | Railway PostgreSQL runs **18.4**, while the worker Docker image installed `pg_dump` **15.19**; logical dump clients must not be older than the server. | Pin the worker image to PostgreSQL 18 client tooling, rebuild, redeploy, and rerun the queued backup. | In progress |
+
+No archive was created and the application database, attachment bucket, and application service remain unchanged.
+
+
+**QA-008 update:** The backup worker Dockerfile now installs the PostgreSQL 18 client from the official PostgreSQL apt repository. `pnpm build && pnpm lint` passed locally; the controlled Railway redeployment and one-time backup retest are next.
+
+
+## v0.4.0 expanded production regression — 2026-08-14
+
+**Result:** **69/69 checks passed; 0 failed.** Coverage now includes the prior role-based workflows plus platform backup settings/history, weekly and monthly policy selection, one-time backup queueing behavior, private and shared saved views, bulk triage updates, subscriptions, duplicate suggestions, and customer release-note draft/publish/visibility flows.
+
+**Backup note:** The manual backup API correctly returns HTTP 409 while the PostgreSQL 18 worker retest is already queued. Archive completion remains the final pending infrastructure validation for QA-008.
+
+
+### QA-008 final retest — 2026-08-14
+
+**Result:** Passed. The managed Railway backup worker processed the queued one-time backup successfully using the PostgreSQL 18 client. It created the private archive `platform/backups/2026/08/bugflow-2026-08-14T22-16-30-495Z-c51b4488-fafa-4e70-9f8a-68e45cdd02ce.dump` with a recorded size of **101,075 bytes** and SHA-256 checksum `c10afdae90d1b669207600f37acb4198bc2a6d17093c6b4860dbfb9a19bf3654`.
+
+**Status:** QA-008 is fixed. One-time, weekly, and monthly policy handling is available through the platform administrator workspace; weekly/monthly execution uses the Railway worker’s 15-minute UTC policy-evaluation tick.
+
