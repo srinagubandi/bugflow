@@ -10,10 +10,11 @@
     "dev": "concurrently \"vite\" \"tsx watch server.ts\"",
     "dev:client": "vite",
     "dev:server": "tsx watch server.ts",
-    "build": "tsc --noEmit && vite build && tsup server.ts --format esm --target node22 --out-dir dist-server --sourcemap",
+    "build": "tsc --noEmit && vite build && tsup server.ts backup-worker.ts --format esm --target node22 --out-dir dist-server --sourcemap",
     "start": "node --enable-source-maps dist-server/server.js",
     "db:migrate": "tsx migrate.ts",
     "db:seed": "tsx seed.ts",
+    "backup:run": "node --enable-source-maps dist-server/backup-worker.js",
     "lint": "tsc --noEmit"
   },
   "dependencies": {

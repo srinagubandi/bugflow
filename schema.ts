@@ -229,3 +229,81 @@ DROP TRIGGER IF EXISTS report_comments_set_updated_at ON report_comments;
 CREATE TRIGGER report_comments_set_updated_at BEFORE UPDATE ON report_comments
 FOR EACH ROW EXECUTE FUNCTION bugflow_set_updated_at();
 `;
+
+
+export const expansionSchemaSql = `
+CREATE TYPE backup_frequency AS ENUM ('manual', 'weekly', 'monthly');
+CREATE TYPE backup_run_status AS ENUM ('queued', 'running', 'succeeded', 'failed');
+
+CREATE TABLE IF NOT EXISTS platform_settings (
+  id BOOLEAN PRIMARY KEY DEFAULT true CHECK (id),
+  backup_frequency backup_frequency NOT NULL DEFAULT 'manual',
+  backup_enabled BOOLEAN NOT NULL DEFAULT false,
+  backup_day_of_week SMALLINT NOT NULL DEFAULT 0 CHECK (backup_day_of_week BETWEEN 0 AND 6),
+  backup_day_of_month SMALLINT NOT NULL DEFAULT 1 CHECK (backup_day_of_month BETWEEN 1 AND 28),
+  backup_hour_utc SMALLINT NOT NULL DEFAULT 3 CHECK (backup_hour_utc BETWEEN 0 AND 23),
+  last_backup_requested_at TIMESTAMPTZ,
+  updated_by UUID REFERENCES users(id) ON DELETE SET NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO platform_settings (id) VALUES (true) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS backup_runs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  status backup_run_status NOT NULL DEFAULT 'queued',
+  trigger backup_frequency NOT NULL DEFAULT 'manual',
+  storage_key TEXT UNIQUE,
+  byte_size BIGINT CHECK (byte_size >= 0),
+  checksum TEXT,
+  requested_by UUID REFERENCES users(id) ON DELETE SET NULL,
+  started_at TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ,
+  error_message TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS backup_runs_created_idx ON backup_runs(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS saved_views (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  filters JSONB NOT NULL DEFAULT '{}'::jsonb,
+  is_shared BOOLEAN NOT NULL DEFAULT false,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (organization_id, owner_id, name)
+);
+CREATE INDEX IF NOT EXISTS saved_views_org_idx ON saved_views(organization_id, owner_id);
+
+CREATE TABLE IF NOT EXISTS report_subscriptions (
+  report_id UUID NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (report_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS release_notes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  version TEXT,
+  published_at TIMESTAMPTZ,
+  created_by UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS release_notes_org_published_idx ON release_notes(organization_id, published_at DESC NULLS LAST);
+
+DROP TRIGGER IF EXISTS platform_settings_set_updated_at ON platform_settings;
+CREATE TRIGGER platform_settings_set_updated_at BEFORE UPDATE ON platform_settings
+FOR EACH ROW EXECUTE FUNCTION bugflow_set_updated_at();
+DROP TRIGGER IF EXISTS saved_views_set_updated_at ON saved_views;
+CREATE TRIGGER saved_views_set_updated_at BEFORE UPDATE ON saved_views
+FOR EACH ROW EXECUTE FUNCTION bugflow_set_updated_at();
+DROP TRIGGER IF EXISTS release_notes_set_updated_at ON release_notes;
+CREATE TRIGGER release_notes_set_updated_at BEFORE UPDATE ON release_notes
+FOR EACH ROW EXECUTE FUNCTION bugflow_set_updated_at();
+`;

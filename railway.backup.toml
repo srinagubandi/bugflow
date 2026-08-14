@@ -1,0 +1,16 @@
+[build]
+
+builder = "DOCKERFILE"
+
+dockerfilePath = "backup.Dockerfile"
+
+
+
+[deploy]
+
+startCommand = "node dist-server/backup-worker.js"
+
+cronSchedule = "*/15 * * * *"
+
+restartPolicyType = "NEVER"
+

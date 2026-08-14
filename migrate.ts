@@ -1,8 +1,11 @@
 import 'dotenv/config';
 import { Pool } from 'pg';
-import { schemaSql } from './schema.js';
+import { expansionSchemaSql, schemaSql } from './schema.js';
 
-const migrationVersion = '001_initial_schema';
+const migrations = [
+  { version: '001_initial_schema', sql: schemaSql },
+  { version: '002_productivity_backup_schema', sql: expansionSchemaSql },
+] as const;
 
 async function migrate() {
   const connectionString = process.env.DATABASE_URL;
@@ -20,20 +23,24 @@ async function migrate() {
   try {
     await pool.query('CREATE EXTENSION IF NOT EXISTS citext;');
     await pool.query('CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());');
-    const applied = await pool.query('SELECT 1 FROM schema_migrations WHERE version = $1', [migrationVersion]);
-
-    if (applied.rowCount) {
-      console.log(`Migration ${migrationVersion} already applied.`);
-      return;
-    }
-
     await pool.query('SELECT pg_advisory_lock(74821695)');
     try {
-      const recheck = await pool.query('SELECT 1 FROM schema_migrations WHERE version = $1', [migrationVersion]);
-      if (!recheck.rowCount) {
-        await pool.query(schemaSql);
-        await pool.query('INSERT INTO schema_migrations (version) VALUES ($1)', [migrationVersion]);
-        console.log(`Applied ${migrationVersion}.`);
+      for (const migration of migrations) {
+        const applied = await pool.query('SELECT 1 FROM schema_migrations WHERE version = $1', [migration.version]);
+        if (applied.rowCount) {
+          console.log(`Migration ${migration.version} already applied.`);
+          continue;
+        }
+        await pool.query('BEGIN');
+        try {
+          await pool.query(migration.sql);
+          await pool.query('INSERT INTO schema_migrations (version) VALUES ($1)', [migration.version]);
+          await pool.query('COMMIT');
+          console.log(`Applied ${migration.version}.`);
+        } catch (error) {
+          await pool.query('ROLLBACK');
+          throw error;
+        }
       }
     } finally {
       await pool.query('SELECT pg_advisory_unlock(74821695)');
