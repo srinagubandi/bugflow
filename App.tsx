@@ -184,13 +184,15 @@ function LiveReportPanel({ report, onClose, onStatus, onSaved }: { report: Repor
       {!detail && !error && <Box sx={{ p: 5, display: 'grid', placeItems: 'center' }}><CircularProgress /></Box>}
       {error && <Alert severity="error" sx={{ m: 2 }}>{error}</Alert>}
       {detail && <Box sx={{ overflowY: 'auto', flex: 1, p: { xs: 2, sm: 3 }, display: 'grid', gridTemplateColumns: { xs: '1fr', md: 'minmax(0,1fr) 250px' }, gap: { xs: 3, md: 4 } }}>
-        <Stack spacing={3} component="form" onSubmit={updateReport}>
+        <Stack spacing={3}>
+          <Stack component="form" onSubmit={updateReport} spacing={3}>
           <Box><Typography variant="overline" color="primary.main">{reportCode(detail.report)} · {detail.report.projectName}</Typography><TextField name="title" defaultValue={detail.report.title} variant="standard" fullWidth inputProps={{ 'aria-label': 'Report title' }} sx={{ mt: .5, '& input': { fontSize: { xs: 26, sm: 32 }, fontWeight: 700, letterSpacing: '-.03em', lineHeight: 1.18 } }}/></Box>
           <TextField name="description" defaultValue={detail.report.description} label="Description" required multiline minRows={3} fullWidth />
           <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}><TextField name="reproductionSteps" defaultValue={detail.report.reproduction_steps ?? ''} label="Steps to reproduce" multiline minRows={3} fullWidth/><TextField name="expectedResult" defaultValue={detail.report.expected_result ?? ''} label="Expected result" multiline minRows={3} fullWidth/></Stack>
           <TextField name="actualResult" defaultValue={detail.report.actual_result ?? ''} label="Actual result" multiline minRows={2} fullWidth/>
           <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}><TextField name="browserDevice" defaultValue={detail.report.browser_device ?? ''} label="Browser / device" fullWidth/><TextField name="applicationVersion" defaultValue={detail.report.application_version ?? ''} label="App version" fullWidth/></Stack>
           <Stack direction="row" justifyContent="flex-end"><Button type="submit" variant="outlined" disabled={busy}>{busy ? 'Saving…' : 'Save changes'}</Button></Stack>
+          </Stack>
           <Divider/>
           <Box><Typography variant="overline" color="text.secondary">Evidence</Typography><Stack spacing={1} sx={{ mt: 1 }}>{detail.attachments.length ? detail.attachments.map((attachment) => <Card variant="outlined" key={attachment.id}><CardActionArea onClick={() => void downloadAttachment(attachment.id)}><CardContent sx={{ py: 1.25, '&:last-child': { pb: 1.25 }, display: 'flex', alignItems: 'center', gap: 1.25 }}><UploadFileRounded color="primary" fontSize="small"/><Box flex={1}><Typography variant="body2">{attachment.originalFilename}</Typography><Typography variant="caption" color="text.secondary">{Math.ceil(attachment.byteSize / 1024)} KB · {relativeDate(attachment.createdAt)}</Typography></Box></CardContent></CardActionArea></Card>) : <Typography variant="body2" color="text.secondary">No attachments added.</Typography>}</Stack></Box>
           <Divider/>
