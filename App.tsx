@@ -166,9 +166,10 @@ function LiveReportPanel({ report, onClose, onStatus, onSaved }: { report: Repor
   };
   const addComment = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault(); if (!report) return;
-    const form = new FormData(event.currentTarget); const body = String(form.get('body') ?? '').trim(); if (!body) return;
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement); const body = String(form.get('body') ?? '').trim(); if (!body) return;
     setBusy(true); setError('');
-    try { await api(`/api/reports/${report.id}/comments`, { method: 'POST', body: JSON.stringify({ body, visibility: form.get('visibility') === 'internal' ? 'internal' : 'customer' }) }); (event.currentTarget as HTMLFormElement).reset(); await loadDetail(); }
+    try { await api(`/api/reports/${report.id}/comments`, { method: 'POST', body: JSON.stringify({ body, visibility: form.get('visibility') === 'internal' ? 'internal' : 'customer' }) }); formElement.reset(); await loadDetail(); }
     catch (err) { setError(err instanceof Error ? err.message : 'Unable to post comment.'); }
     finally { setBusy(false); }
   };
