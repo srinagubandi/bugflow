@@ -185,3 +185,17 @@ No archive was created and the application database, attachment bucket, and appl
 
 **Status:** QA-008 is fixed. One-time, weekly, and monthly policy handling is available through the platform administrator workspace; weekly/monthly execution uses the Railway worker’s 15-minute UTC policy-evaluation tick.
 
+
+### QA-009 — Railway application build configuration
+
+**Failure:** The `bugflow-app` deployment on `feature/admin-backups-portal` failed during `pnpm install --frozen-lockfile --prefer-offline` with `ERROR packages field missing or empty` after the backup-worker approval file was added.
+
+**Root cause:** `pnpm-workspace.yaml` contained `allowBuilds` but no `packages` definition. Railpack correctly treated it as a workspace manifest and required at least one package path.
+
+**Fix:** Added `packages: ['.']` alongside the existing trusted `esbuild` approval. A Railway-equivalent frozen install, production build, and strict type check now pass locally. Controlled redeployment is pending.
+
+
+### QA-009 final retest — 2026-08-14
+
+**Result:** Passed. Railway built and deployed the corrected feature branch successfully after adding the root package definition to `pnpm-workspace.yaml`. The live health endpoint returned HTTP 200 with private storage configured, and the expanded production regression suite passed **70/70** checks with no failures.
+
