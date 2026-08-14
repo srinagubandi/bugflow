@@ -446,7 +446,7 @@ app.get('/api/reports/:reportId', async (request: AppRequest, response) => {
   if (!access.allowed || !access.report) return response.status(403).json({ error: 'You do not have access to this report.' });
   const role = actor.isPlatformAdmin ? 'admin' : await organizationRole(actor.id, access.report.organization_id);
   const report = await query(
-    `SELECT r.*, p.name AS "projectName", p.slug AS "projectSlug", u.display_name AS "reporterName", a.display_name AS "assigneeName"
+    `SELECT r.*, r.sequence_number AS "sequenceNumber", p.name AS "projectName", p.slug AS "projectSlug", u.display_name AS "reporterName", a.display_name AS "assigneeName"
      FROM reports r JOIN projects p ON p.id = r.project_id JOIN users u ON u.id = r.reporter_id
      LEFT JOIN users a ON a.id = r.assignee_id WHERE r.id = $1`, [reportId],
   );

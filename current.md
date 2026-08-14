@@ -73,3 +73,29 @@ _New failures will be added immediately and marked fixed only after a successful
 | 5 | Replaced the static report panel with a live Material Design detail drawer showing editable report fields, customer/internal activity, secure attachments, labels, related reports, and a property rail. | `pnpm build && pnpm lint` completed successfully. | Complete locally; production validation queued. |
 | 6 | Added secure server-side triage filters and an original grouped, collapsible Material Design triage view with status/priority filters and compact density. | `pnpm build && pnpm lint` completed successfully. | Complete locally; production validation queued. |
 | 7 | Expanded the production test harness from HTTP probes to semantic assertions for detail visibility, editing, assignments, labels, duplicates, notifications, audit history, deactivation, and reset-delivery behavior. | `pnpm build && pnpm lint` completed successfully. | Ready for controlled production deployment and regression test. |
+
+
+## Production regression run — 2026-08-14 (controlled branch)
+
+**Result:** 34/46 checks passed; 12 checks failed. The failures share a likely route-contract or deployment-source root cause: report detail, report editing, assignment, notifications, labels, duplicate linkage, audit history, organization-user listing, and user activation calls returned HTTP 200 with the SPA fallback rather than a JSON API payload. The deactivated-user authentication check also failed because the preceding deactivation mutation did not return structured JSON.
+
+**Passing coverage:** authentication; multi-organization setup; project ACL; report creation; visible and internal comment boundaries; status transitions; private attachment upload; signed downloads; soft delete and restore; priority filtering; and truthful unavailable-email behavior.
+
+**Next cycle:** compare the live route table against the semantic QA harness paths; correct the mismatch or deployment-source issue; rebuild and redeploy; rerun all 46 checks before any new feature work.
+
+
+## Production regression retest — 2026-08-14 (controlled branch)
+
+**Result:** **49/49 checks passed; 0 failed.** The initial 12 failures were a timing issue: the first suite started before Railway had activated the controlled branch’s expanded server routes. A route probe confirmed JSON authorization responses from the new endpoints, and the complete retest passed.
+
+**Verified end-to-end:** platform and organization authentication; organization/project/user provisioning; project ACL; team and customer access boundaries; report creation, reporting fields and list filtering; external/internal comments; status progression; attachments and signed download boundaries; soft deletion/restoration; customer-safe report detail/editing; assignment and read-state notifications; label creation/application; duplicate linking; audit history; user listing, deactivation and reactivation; and password-reset behavior when Resend is unavailable.
+
+**External configuration prerequisite:** password-reset and customer email delivery correctly return HTTP 503 until a Resend API key and verified sender are configured. This is an intentional, truthful configuration state—not an application defect.
+
+
+## UI validation defect — 2026-08-14
+
+| ID | Area | Failure | Root cause hypothesis | Fix | Retest status |
+|---|---|---|---|---|---|
+| QA-005 | Report detail identity | The live Material Design report drawer rendered the breadcrumb as `BF-undefined` even though the report row correctly displayed `BF-1`. | The client detail header likely uses a non-existent `number` property instead of the API’s `sequence` field. | Pending targeted client-field correction. | Pending |
+| QA-005 | Report detail identity | `BF-undefined` appeared in the live detail drawer. | Detail SQL returned `sequence_number` but the client contract uses `sequenceNumber`. | Added explicit `r.sequence_number AS "sequenceNumber"` to the detail query; build and lint pass. | Pending controlled deploy and UI retest |
