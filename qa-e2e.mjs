@@ -75,16 +75,20 @@ async function createUser(role, name, identity = role) {
 }
 
 state.users.team_member = await createUser('team_member', 'QA Team Member');
+state.users.developer = await createUser('developer', 'QA Developer');
 state.users.customer = await createUser('customer', 'QA Customer');
 state.users.outsider = await createUser('customer', 'QA Restricted Customer', 'restricted-customer');
 
 await expect('Admin grants team member report-management access', () => request(`/api/projects/${state.project.id}/access/${state.users.team_member.id}`, { method: 'PUT', body: JSON.stringify({ canView: true, canReport: true, canComment: true, canManage: true }) }, orgAdmin), 200);
+await expect('Admin grants developer report-management access', () => request(`/api/projects/${state.project.id}/access/${state.users.developer.id}`, { method: 'PUT', body: JSON.stringify({ canView: true, canReport: true, canComment: true, canManage: true }) }, orgAdmin), 200);
 await expect('Admin grants customer collaborative access', () => request(`/api/projects/${state.project.id}/access/${state.users.customer.id}`, { method: 'PUT', body: JSON.stringify({ canView: true, canReport: true, canComment: true, canManage: false }) }, orgAdmin), 200);
+await expect('Admin cannot grant customer staff management', () => request(`/api/projects/${state.project.id}/access/${state.users.customer.id}`, { method: 'PUT', body: JSON.stringify({ canView: true, canReport: true, canComment: true, canManage: true }) }, orgAdmin), 400);
 const accessInventory = await expect('Admin lists organization project-access grants', () => request(`/api/organizations/${state.organization.id}/project-access`, {}, orgAdmin), 200);
 if (accessInventory?.body?.access?.some((grant) => grant.projectId === state.project.id && grant.userId === state.users.team_member.id && grant.canManage)) record('Project-access inventory returns team management grant', true, 'Team management grant is visible to organization administrators.');
 else record('Project-access inventory returns team management grant', false, 'Expected team management grant was missing from access inventory.');
 
 const team = await login(state.users.team_member.username, password, 'Team member');
+const developer = await login(state.users.developer.username, password, 'Developer');
 const customer = await login(state.users.customer.username, password, 'Customer');
 const outsider = await login(state.users.outsider.username, password, 'Restricted customer');
 
@@ -142,7 +146,16 @@ else record('Customer detail excludes internal comments', true, 'Internal commen
 
 await expect('Customer edits own report', () => request(`/api/reports/${state.report.id}`, { method: 'PATCH', body: JSON.stringify({ title: `Edited ${runId}`, priority: 'critical' }) }, customer), 200);
 await expect('Report list filters by priority', () => request(`/api/organizations/${state.organization.id}/reports?priority=critical`, {}, customer), 200);
+const assigneeDirectory = await expect('Admin lists eligible delivery and review owners', () => request(`/api/projects/${state.project.id}/assignees`, {}, orgAdmin), 200);
+if (assigneeDirectory?.body?.assignees?.some((candidate) => candidate.id === state.users.developer.id && candidate.role === 'developer')) record('Developer appears in eligible assignee directory', true, 'Active developer with project visibility is eligible for delivery and review ownership.');
+else record('Developer appears in eligible assignee directory', false, 'Eligible developer was missing from the project assignee directory.');
+await expect('Developer can list eligible project assignees', () => request(`/api/projects/${state.project.id}/assignees`, {}, developer), 200);
+await expect('Customer is blocked from eligible assignee directory', () => request(`/api/projects/${state.project.id}/assignees`, {}, customer), 403);
 await expect('Admin assigns report to team member', () => request(`/api/reports/${state.report.id}/assignee`, { method: 'PATCH', body: JSON.stringify({ assigneeId: state.users.team_member.id }) }, orgAdmin), 200);
+await expect('Admin reassigns delivery owner to developer', () => request(`/api/reports/${state.report.id}/assignee`, { method: 'PATCH', body: JSON.stringify({ assigneeId: state.users.developer.id }) }, orgAdmin), 200);
+await expect('Admin assigns developer as review owner', () => request(`/api/reports/${state.report.id}/reviewer`, { method: 'PATCH', body: JSON.stringify({ reviewerId: state.users.developer.id }) }, orgAdmin), 200);
+await expect('Developer reassigns review ownership to team member', () => request(`/api/reports/${state.report.id}/reviewer`, { method: 'PATCH', body: JSON.stringify({ reviewerId: state.users.team_member.id }) }, developer), 200);
+await expect('Customer cannot reassign review ownership', () => request(`/api/reports/${state.report.id}/reviewer`, { method: 'PATCH', body: JSON.stringify({ reviewerId: state.users.developer.id }) }, customer), 403);
 const teamNotifications = await expect('Assigned team member receives in-product notification', () => request('/api/notifications', {}, team), 200);
 const assignment = teamNotifications?.body?.notifications?.find((notification) => notification.type === 'assignment');
 if (assignment?.id) await expect('Team member marks assignment notification read', () => request(`/api/notifications/${assignment.id}/read`, { method: 'PATCH' }, team), 200);

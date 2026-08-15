@@ -105,7 +105,7 @@ function requirePlatformAdmin(request: AppRequest, response: Response): CurrentU
 }
 
 async function organizationRole(userId: string, organizationId: string) {
-  const result = await query<{ role: 'admin' | 'team_member' | 'customer' }>(
+  const result = await query<{ role: 'admin' | 'team_member' | 'developer' | 'customer' }>(
     `SELECT role FROM memberships WHERE user_id = $1 AND organization_id = $2 AND is_active = true`,
     [userId, organizationId],
   );
@@ -121,6 +121,8 @@ async function checkProjectAccess(user: CurrentUser, projectId: string, action: 
   const role = await organizationRole(user.id, organizationId);
   if (!role) return { allowed: false, organizationId } as const;
   if (role === 'admin') return { allowed: true, organizationId } as const;
+  // Customers retain their self-service reporting and commenting rights, but cannot receive staff-only project management through an ACL grant.
+  if (role === 'customer' && action === 'manage') return { allowed: false, organizationId } as const;
 
   const column = action === 'view' ? 'can_view' : action === 'report' ? 'can_report' : action === 'comment' ? 'can_comment' : 'can_manage';
   const access = await query<{ allowed: boolean }>(`SELECT ${column} AS allowed FROM project_access WHERE project_id = $1 AND user_id = $2`, [projectId, user.id]);
@@ -137,6 +139,28 @@ async function reportAccess(user: CurrentUser, reportId: string, action: 'view' 
   const access = await checkProjectAccess(user, item.project_id, action === 'manage' ? 'manage' : action);
   if (!access.allowed || (item.deleted_at && action !== 'manage')) return { allowed: false, report: item } as const;
   return { allowed: true, report: item } as const;
+}
+
+type AssignmentCandidate = { id: string; displayName: string; username: string; role: 'admin' | 'team_member' | 'developer' };
+
+/** Eligible delivery and review owners must be active staff with report visibility in the project. */
+async function listEligibleAssignees(organizationId: string, projectId: string) {
+  return query<AssignmentCandidate>(
+    `SELECT u.id, u.display_name AS "displayName", u.username, m.role
+     FROM memberships m
+     JOIN users u ON u.id = m.user_id
+     LEFT JOIN project_access pa ON pa.project_id = $2 AND pa.user_id = m.user_id
+     WHERE m.organization_id = $1 AND m.is_active = true AND u.is_active = true AND u.deleted_at IS NULL
+       AND m.role IN ('admin', 'team_member', 'developer')
+       AND (m.role = 'admin' OR COALESCE(pa.can_view, false) = true)
+     ORDER BY CASE m.role WHEN 'admin' THEN 0 WHEN 'developer' THEN 1 ELSE 2 END, u.display_name`,
+    [organizationId, projectId],
+  );
+}
+
+async function isEligibleAssignee(organizationId: string, projectId: string, userId: string) {
+  const candidates = await listEligibleAssignees(organizationId, projectId);
+  return candidates.rows.some((candidate) => candidate.id === userId);
 }
 
 /** Customer-visible updates always create an in-product notification; email is attempted only when configured. */
@@ -172,7 +196,7 @@ async function notifyReporterOfVisibleUpdate(input: { reportId: string; actorId:
 const loginSchema = z.object({ identifier: z.string().min(1), password: z.string().min(8) });
 const organizationSchema = z.object({ name: z.string().min(2).max(120), slug: z.string().regex(/^[a-z0-9-]+$/), admin: z.object({ username: z.string().min(3).max(60), email: z.string().email(), displayName: z.string().min(2).max(120), password: z.string().min(12).max(200) }) });
 const projectSchema = z.object({ name: z.string().min(2).max(120), slug: z.string().regex(/^[a-z0-9-]+$/), description: z.string().max(500).optional(), color: z.string().regex(/^#[0-9a-fA-F]{6}$/).default('#8176ff') });
-const organizationUserSchema = z.object({ username: z.string().min(3).max(60), email: z.string().email(), displayName: z.string().min(2).max(120), password: z.string().min(12).max(200), role: z.enum(['admin', 'team_member', 'customer']) });
+const organizationUserSchema = z.object({ username: z.string().min(3).max(60), email: z.string().email(), displayName: z.string().min(2).max(120), password: z.string().min(12).max(200), role: z.enum(['admin', 'team_member', 'developer', 'customer']) });
 const projectAccessSchema = z.object({ canView: z.boolean().default(true), canReport: z.boolean().default(true), canComment: z.boolean().default(true), canManage: z.boolean().default(false) });
 const reportSchema = z.object({ projectId: z.string().uuid(), title: z.string().min(4).max(240), description: z.string().min(4).max(20000), reproductionSteps: z.string().max(20000).optional(), expectedResult: z.string().max(20000).optional(), actualResult: z.string().max(20000).optional(), browserDevice: z.string().max(500).optional(), applicationVersion: z.string().max(200).optional(), priority: z.enum(['low', 'medium', 'high', 'critical']).default('medium'), dueAt: z.string().datetime().optional() });
 const commentSchema = z.object({ body: z.string().min(1).max(20000), visibility: z.enum(['customer', 'internal']).default('customer') });
@@ -192,6 +216,7 @@ const reportUpdateSchema = z.object({
   dueAt: z.string().datetime().nullable().optional(),
 }).refine((value) => Object.keys(value).length > 0, 'Provide at least one report field.');
 const assigneeSchema = z.object({ assigneeId: z.string().uuid().nullable() });
+const reviewerSchema = z.object({ reviewerId: z.string().uuid().nullable() });
 const labelSchema = z.object({ name: z.string().min(1).max(60), color: z.string().regex(/^#[0-9a-fA-F]{6}$/).default('#6750A4') });
 const reportLabelSchema = z.object({ labelId: z.string().uuid() });
 const duplicateSchema = z.object({ duplicateOfId: z.string().uuid() });
@@ -405,8 +430,9 @@ app.put('/api/projects/:projectId/access/:userId', async (request: AppRequest, r
   if (role !== 'admin') return response.status(403).json({ error: 'Organization administrator access is required.' });
   const parsed = projectAccessSchema.safeParse(request.body);
   if (!parsed.success) return response.status(400).json({ error: 'Provide valid access permissions.' });
-  const membership = await query('SELECT 1 FROM memberships WHERE organization_id = $1 AND user_id = $2 AND is_active = true', [project.rows[0].organization_id, userId]);
+  const membership = await query<{ role: string }>('SELECT role FROM memberships WHERE organization_id = $1 AND user_id = $2 AND is_active = true', [project.rows[0].organization_id, userId]);
   if (!membership.rowCount) return response.status(400).json({ error: 'The user must be an active member of this organization.' });
+  if (membership.rows[0].role === 'customer' && parsed.data.canManage) return response.status(400).json({ error: 'Customer project access cannot include staff-only management permission.' });
 
   const saved = await query(
     `INSERT INTO project_access (project_id, user_id, can_view, can_report, can_comment, can_manage)
@@ -417,6 +443,16 @@ app.put('/api/projects/:projectId/access/:userId', async (request: AppRequest, r
   );
   await writeAuditEvent({ organizationId: project.rows[0].organization_id, actorId: actor.id, entityType: 'project_access', entityId: saved.rows[0].id, action: 'project_access_updated', metadata: { projectId, userId, ...parsed.data }, ipAddress: clientIp(request) });
   response.json(saved.rows[0]);
+});
+
+app.get('/api/projects/:projectId/assignees', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const projectId = routeParam(request.params.projectId);
+  const access = await checkProjectAccess(actor, projectId, 'manage');
+  if (!access.allowed || !access.organizationId) return response.status(403).json({ error: 'Project manager access is required to view the assignee directory.' });
+  const assignees = await listEligibleAssignees(access.organizationId, projectId);
+  response.json({ assignees: assignees.rows });
 });
 
 app.get('/api/organizations/:organizationId/reports', async (request: AppRequest, response) => {
@@ -466,9 +502,10 @@ app.get('/api/reports/:reportId', async (request: AppRequest, response) => {
   if (!access.allowed || !access.report) return response.status(403).json({ error: 'You do not have access to this report.' });
   const role = actor.isPlatformAdmin ? 'admin' : await organizationRole(actor.id, access.report.organization_id);
   const report = await query(
-    `SELECT r.*, r.sequence_number AS "sequenceNumber", p.name AS "projectName", p.slug AS "projectSlug", u.display_name AS "reporterName", a.display_name AS "assigneeName"
+    `SELECT r.*, r.sequence_number AS "sequenceNumber", p.name AS "projectName", p.slug AS "projectSlug", u.display_name AS "reporterName", a.display_name AS "assigneeName", rv.display_name AS "reviewerName"
      FROM reports r JOIN projects p ON p.id = r.project_id JOIN users u ON u.id = r.reporter_id
-     LEFT JOIN users a ON a.id = r.assignee_id WHERE r.id = $1`, [reportId],
+     LEFT JOIN users a ON a.id = r.assignee_id
+     LEFT JOIN users rv ON rv.id = r.reviewer_id WHERE r.id = $1`, [reportId],
   );
   const comments = await query(
     `SELECT c.id, c.body, c.visibility, c.created_at AS "createdAt", c.updated_at AS "updatedAt", u.display_name AS "authorName"
@@ -485,7 +522,8 @@ app.get('/api/reports/:reportId', async (request: AppRequest, response) => {
     `SELECT r.id, r.sequence_number AS "sequenceNumber", r.title, r.status
      FROM report_duplicates rd JOIN reports r ON r.id = rd.duplicate_of_report_id WHERE rd.report_id = $1 AND r.deleted_at IS NULL`, [reportId],
   );
-  response.json({ report: report.rows[0], comments: comments.rows, attachments: attachments.rows, labels: labels.rows, duplicates: duplicates.rows });
+  const management = await checkProjectAccess(actor, access.report.project_id, 'manage');
+  response.json({ report: report.rows[0], comments: comments.rows, attachments: attachments.rows, labels: labels.rows, duplicates: duplicates.rows, canManage: management.allowed });
 });
 
 app.patch('/api/reports/:reportId', async (request: AppRequest, response) => {
@@ -523,14 +561,32 @@ app.patch('/api/reports/:reportId/assignee', async (request: AppRequest, respons
   if (!parsed.success) return response.status(400).json({ error: 'Provide a valid assignee.' });
   const access = await reportAccess(actor, reportId, 'manage');
   if (!access.allowed || !access.report) return response.status(403).json({ error: 'You do not have permission to assign this report.' });
-  if (parsed.data.assigneeId) {
-    const assignee = await query(`SELECT 1 FROM memberships WHERE organization_id = $1 AND user_id = $2 AND is_active = true AND role IN ('admin', 'team_member')`, [access.report.organization_id, parsed.data.assigneeId]);
-    if (!assignee.rowCount) return response.status(400).json({ error: 'The assignee must be an active administrator or team member in this organization.' });
+  if (parsed.data.assigneeId && !await isEligibleAssignee(access.report.organization_id, access.report.project_id, parsed.data.assigneeId)) {
+    return response.status(400).json({ error: 'The assignee must be an active administrator, team member, or developer with access to this project.' });
   }
   const updated = await query('UPDATE reports SET assignee_id = $1 WHERE id = $2 RETURNING *', [parsed.data.assigneeId, reportId]);
   await writeAuditEvent({ organizationId: access.report.organization_id, actorId: actor.id, entityType: 'report', entityId: reportId, action: 'assignee_changed', metadata: { assigneeId: parsed.data.assigneeId }, ipAddress: clientIp(request) });
   if (parsed.data.assigneeId && parsed.data.assigneeId !== actor.id) {
-    await query(`INSERT INTO notifications (organization_id, user_id, report_id, type, title, body) VALUES ($1, $2, $3, 'assignment', 'A report was assigned to you', 'Open the report to review its priority and due date.')`, [access.report.organization_id, parsed.data.assigneeId, reportId]);
+    await query(`INSERT INTO notifications (organization_id, user_id, report_id, type, title, body) VALUES ($1, $2, $3, 'assignment', 'A report was assigned to you', 'Open the report to review its priority, ownership, and due date.')`, [access.report.organization_id, parsed.data.assigneeId, reportId]);
+  }
+  response.json(updated.rows[0]);
+});
+
+app.patch('/api/reports/:reportId/reviewer', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const reportId = routeParam(request.params.reportId);
+  const parsed = reviewerSchema.safeParse(request.body);
+  if (!parsed.success) return response.status(400).json({ error: 'Provide a valid reviewer.' });
+  const access = await reportAccess(actor, reportId, 'manage');
+  if (!access.allowed || !access.report) return response.status(403).json({ error: 'You do not have permission to assign review ownership for this report.' });
+  if (parsed.data.reviewerId && !await isEligibleAssignee(access.report.organization_id, access.report.project_id, parsed.data.reviewerId)) {
+    return response.status(400).json({ error: 'The review owner must be an active administrator, team member, or developer with access to this project.' });
+  }
+  const updated = await query('UPDATE reports SET reviewer_id = $1 WHERE id = $2 RETURNING *', [parsed.data.reviewerId, reportId]);
+  await writeAuditEvent({ organizationId: access.report.organization_id, actorId: actor.id, entityType: 'report', entityId: reportId, action: 'reviewer_changed', metadata: { reviewerId: parsed.data.reviewerId }, ipAddress: clientIp(request) });
+  if (parsed.data.reviewerId && parsed.data.reviewerId !== actor.id) {
+    await query(`INSERT INTO notifications (organization_id, user_id, report_id, type, title, body) VALUES ($1, $2, $3, 'review_assignment', 'A report was assigned for review', 'Open the report to review the current implementation, evidence, and resolution.')`, [access.report.organization_id, parsed.data.reviewerId, reportId]);
   }
   response.json(updated.rows[0]);
 });
@@ -918,14 +974,13 @@ app.patch('/api/organizations/:organizationId/reports/bulk', async (request: App
   if (!role) return response.status(403).json({ error: 'You do not have access to this organization.' });
   const reports = await query<{ id: string; project_id: string }>('SELECT id, project_id FROM reports WHERE organization_id = $1 AND id = ANY($2::uuid[]) AND deleted_at IS NULL', [organizationId, parsed.data.reportIds]);
   if (reports.rowCount !== parsed.data.reportIds.length) return response.status(404).json({ error: 'One or more reports were not found.' });
+  const hasAssignee = Object.prototype.hasOwnProperty.call(parsed.data, 'assigneeId');
   for (const report of reports.rows) {
     const access = await checkProjectAccess(actor, report.project_id, 'manage');
     if (!access.allowed) return response.status(403).json({ error: 'You do not have permission to bulk-update every selected report.' });
-  }
-  const hasAssignee = Object.prototype.hasOwnProperty.call(parsed.data, 'assigneeId');
-  if (hasAssignee && parsed.data.assigneeId) {
-    const member = await query(`SELECT 1 FROM memberships WHERE organization_id = $1 AND user_id = $2 AND is_active = true AND role IN ('admin', 'team_member')`, [organizationId, parsed.data.assigneeId]);
-    if (!member.rowCount) return response.status(400).json({ error: 'The assignee must be an active administrator or team member.' });
+    if (hasAssignee && parsed.data.assigneeId && !await isEligibleAssignee(organizationId, report.project_id, parsed.data.assigneeId)) {
+      return response.status(400).json({ error: 'The assignee must be active staff with access to every selected project.' });
+    }
   }
   const updated = await query(`UPDATE reports SET status = COALESCE($1::bugflow_status, status), assignee_id = CASE WHEN $2::boolean THEN $3::uuid ELSE assignee_id END WHERE id = ANY($4::uuid[]) RETURNING id, status, assignee_id AS "assigneeId"`, [parsed.data.status ?? null, hasAssignee, parsed.data.assigneeId ?? null, parsed.data.reportIds]);
   await writeAuditEvent({ organizationId, actorId: actor.id, entityType: 'report', action: 'reports_bulk_updated', metadata: { reportIds: parsed.data.reportIds, status: parsed.data.status, assigneeId: parsed.data.assigneeId }, ipAddress: clientIp(request) });

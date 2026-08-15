@@ -1,10 +1,12 @@
 import 'dotenv/config';
 import { Pool } from 'pg';
-import { expansionSchemaSql, schemaSql } from './schema.js';
+import { developerAclReviewSchemaSql, developerRoleSchemaSql, expansionSchemaSql, schemaSql } from './schema.js';
 
 const migrations = [
   { version: '001_initial_schema', sql: schemaSql },
   { version: '002_productivity_backup_schema', sql: expansionSchemaSql },
+  { version: '003_developer_role_schema', sql: developerRoleSchemaSql },
+  { version: '004_developer_acl_review_schema', sql: developerAclReviewSchemaSql },
 ] as const;
 
 async function migrate() {

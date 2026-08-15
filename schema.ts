@@ -1,7 +1,7 @@
 export const schemaSql = `
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
-CREATE TYPE bugflow_role AS ENUM ('platform_admin', 'admin', 'team_member', 'customer');
+CREATE TYPE bugflow_role AS ENUM ('platform_admin', 'admin', 'team_member', 'developer', 'customer');
 CREATE TYPE bugflow_status AS ENUM ('new', 'acknowledged', 'in_progress', 'resolved', 'closed');
 CREATE TYPE bugflow_priority AS ENUM ('low', 'medium', 'high', 'critical');
 CREATE TYPE bugflow_comment_visibility AS ENUM ('customer', 'internal');
@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS memberships (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  role bugflow_role NOT NULL CHECK (role IN ('admin', 'team_member', 'customer')),
+  role bugflow_role NOT NULL CHECK (role IN ('admin', 'team_member', 'developer', 'customer')),
   is_active BOOLEAN NOT NULL DEFAULT true,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (organization_id, user_id)
@@ -103,6 +103,7 @@ CREATE TABLE IF NOT EXISTS reports (
   priority bugflow_priority NOT NULL DEFAULT 'medium',
   reporter_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
   assignee_id UUID REFERENCES users(id) ON DELETE SET NULL,
+  reviewer_id UUID REFERENCES users(id) ON DELETE SET NULL,
   due_at TIMESTAMPTZ,
   deleted_at TIMESTAMPTZ,
   deleted_by UUID REFERENCES users(id) ON DELETE SET NULL,
@@ -115,6 +116,7 @@ CREATE TABLE IF NOT EXISTS reports (
 
 CREATE INDEX IF NOT EXISTS reports_project_status_idx ON reports(project_id, status) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS reports_assignee_idx ON reports(assignee_id) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS reports_reviewer_idx ON reports(reviewer_id) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS reports_org_updated_idx ON reports(organization_id, updated_at DESC) WHERE deleted_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS report_labels (
@@ -306,4 +308,31 @@ FOR EACH ROW EXECUTE FUNCTION bugflow_set_updated_at();
 DROP TRIGGER IF EXISTS release_notes_set_updated_at ON release_notes;
 CREATE TRIGGER release_notes_set_updated_at BEFORE UPDATE ON release_notes
 FOR EACH ROW EXECUTE FUNCTION bugflow_set_updated_at();
+`;
+
+
+export const developerRoleSchemaSql = `
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'bugflow_role') THEN
+    CREATE TYPE bugflow_role AS ENUM ('platform_admin', 'admin', 'team_member', 'developer', 'customer');
+  ELSIF NOT EXISTS (
+    SELECT 1
+    FROM pg_enum e
+    JOIN pg_type t ON t.oid = e.enumtypid
+    WHERE t.typname = 'bugflow_role' AND e.enumlabel = 'developer'
+  ) THEN
+    ALTER TYPE bugflow_role ADD VALUE 'developer';
+  END IF;
+END $$;
+`;
+
+export const developerAclReviewSchemaSql = `
+ALTER TABLE memberships DROP CONSTRAINT IF EXISTS memberships_role_check;
+ALTER TABLE memberships
+  ADD CONSTRAINT memberships_role_check CHECK (role IN ('admin', 'team_member', 'developer', 'customer'));
+
+ALTER TABLE reports
+  ADD COLUMN IF NOT EXISTS reviewer_id UUID REFERENCES users(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS reports_reviewer_idx ON reports(reviewer_id) WHERE deleted_at IS NULL;
 `;
