@@ -412,7 +412,7 @@ app.put('/api/projects/:projectId/access/:userId', async (request: AppRequest, r
     `INSERT INTO project_access (project_id, user_id, can_view, can_report, can_comment, can_manage)
      VALUES ($1, $2, $3, $4, $5, $6)
      ON CONFLICT (project_id, user_id) DO UPDATE SET can_view = EXCLUDED.can_view, can_report = EXCLUDED.can_report, can_comment = EXCLUDED.can_comment, can_manage = EXCLUDED.can_manage
-     RETURNING *`,
+     RETURNING id, project_id AS "projectId", user_id AS "userId", can_view AS "canView", can_report AS "canReport", can_comment AS "canComment", can_manage AS "canManage"`,
     [projectId, userId, parsed.data.canView, parsed.data.canReport, parsed.data.canComment, parsed.data.canManage],
   );
   await writeAuditEvent({ organizationId: project.rows[0].organization_id, actorId: actor.id, entityType: 'project_access', entityId: saved.rows[0].id, action: 'project_access_updated', metadata: { projectId, userId, ...parsed.data }, ipAddress: clientIp(request) });
@@ -632,6 +632,23 @@ app.delete('/api/reports/:reportId/duplicates/:duplicateOfId', async (request: A
   if (!access.allowed || !access.report) return response.status(403).json({ error: 'You do not have permission to unlink duplicates.' });
   await query('DELETE FROM report_duplicates WHERE report_id = $1 AND duplicate_of_report_id = $2', [reportId, routeParam(request.params.duplicateOfId)]);
   response.status(204).end();
+});
+
+app.get('/api/organizations/:organizationId/project-access', async (request: AppRequest, response) => {
+  const actor = requireUser(request, response);
+  if (!actor) return;
+  const organizationId = routeParam(request.params.organizationId);
+  const role = actor.isPlatformAdmin ? 'admin' : await organizationRole(actor.id, organizationId);
+  if (role !== 'admin') return response.status(403).json({ error: 'Organization administrator access is required.' });
+  const access = await query(
+    `SELECT pa.project_id AS "projectId", pa.user_id AS "userId", pa.can_view AS "canView", pa.can_report AS "canReport", pa.can_comment AS "canComment", pa.can_manage AS "canManage"
+     FROM project_access pa
+     JOIN projects p ON p.id = pa.project_id
+     JOIN memberships m ON m.user_id = pa.user_id AND m.organization_id = p.organization_id
+     WHERE p.organization_id = $1 AND p.deleted_at IS NULL AND m.is_active = true`,
+    [organizationId],
+  );
+  response.json({ access: access.rows });
 });
 
 app.get('/api/organizations/:organizationId/users', async (request: AppRequest, response) => {

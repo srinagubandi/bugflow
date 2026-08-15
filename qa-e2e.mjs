@@ -80,6 +80,9 @@ state.users.outsider = await createUser('customer', 'QA Restricted Customer', 'r
 
 await expect('Admin grants team member report-management access', () => request(`/api/projects/${state.project.id}/access/${state.users.team_member.id}`, { method: 'PUT', body: JSON.stringify({ canView: true, canReport: true, canComment: true, canManage: true }) }, orgAdmin), 200);
 await expect('Admin grants customer collaborative access', () => request(`/api/projects/${state.project.id}/access/${state.users.customer.id}`, { method: 'PUT', body: JSON.stringify({ canView: true, canReport: true, canComment: true, canManage: false }) }, orgAdmin), 200);
+const accessInventory = await expect('Admin lists organization project-access grants', () => request(`/api/organizations/${state.organization.id}/project-access`, {}, orgAdmin), 200);
+if (accessInventory?.body?.access?.some((grant) => grant.projectId === state.project.id && grant.userId === state.users.team_member.id && grant.canManage)) record('Project-access inventory returns team management grant', true, 'Team management grant is visible to organization administrators.');
+else record('Project-access inventory returns team management grant', false, 'Expected team management grant was missing from access inventory.');
 
 const team = await login(state.users.team_member.username, password, 'Team member');
 const customer = await login(state.users.customer.username, password, 'Customer');
@@ -111,6 +114,7 @@ await expect('Restricted customer receives no reports for unassigned project', a
   if (result.response.status === 200 && Array.isArray(result.body?.reports) && result.body.reports.length !== 0) throw new Error('Restricted user received report data.');
   return result;
 }, 200);
+await expect('Customer is blocked from organization project-access inventory', () => request(`/api/organizations/${state.organization.id}/project-access`, {}, customer), 403);
 
 await expect('Customer adds a customer-visible comment', () => request(`/api/reports/${state.report.id}/comments`, { method: 'POST', body: JSON.stringify({ body: 'QA customer-visible comment', visibility: 'customer' }) }, customer), 201);
 await expect('Team member adds internal comment', () => request(`/api/reports/${state.report.id}/comments`, { method: 'POST', body: JSON.stringify({ body: 'QA internal-only comment', visibility: 'internal' }) }, team), 201);
@@ -154,9 +158,12 @@ const duplicateResult = await expect('Customer creates second report for duplica
 if (duplicateResult?.body?.id) await expect('Admin links a duplicate report', () => request(`/api/reports/${duplicateResult.body.id}/duplicates`, { method: 'POST', body: JSON.stringify({ duplicateOfId: state.report.id }) }, orgAdmin), 201);
 await expect('Admin retrieves organization audit history', () => request(`/api/organizations/${state.organization.id}/audit`, {}, orgAdmin), 200);
 await expect('Admin lists organization users', () => request(`/api/organizations/${state.organization.id}/users`, {}, orgAdmin), 200);
-await expect('Admin deactivates restricted customer', () => request(`/api/organizations/${state.organization.id}/users/${state.users.outsider.id}/deactivate`, { method: 'POST' }, orgAdmin), 200);
-await expect('Deactivated user cannot authenticate', () => request('/api/auth/login', { method: 'POST', body: JSON.stringify({ identifier: state.users.outsider.username, password }) }), 401);
-await expect('Admin reactivates restricted customer', () => request(`/api/organizations/${state.organization.id}/users/${state.users.outsider.id}/activate`, { method: 'POST' }, orgAdmin), 200);
+await expect('Admin deactivates customer with project access', () => request(`/api/organizations/${state.organization.id}/users/${state.users.customer.id}/deactivate`, { method: 'POST' }, orgAdmin), 200);
+const inactiveFilteredInventory = await expect('Admin project-access inventory omits inactive members', () => request(`/api/organizations/${state.organization.id}/project-access`, {}, orgAdmin), 200);
+if (inactiveFilteredInventory?.body?.access?.some((grant) => grant.userId === state.users.customer.id)) record('Inactive member grants are not exposed in access inventory', false, 'Inactive member appeared in project-access inventory.');
+else record('Inactive member grants are not exposed in access inventory', true, 'Inactive members are excluded from project-access inventory.');
+await expect('Deactivated user cannot authenticate', () => request('/api/auth/login', { method: 'POST', body: JSON.stringify({ identifier: state.users.customer.username, password }) }), 401);
+await expect('Admin reactivates customer with project access', () => request(`/api/organizations/${state.organization.id}/users/${state.users.customer.id}/activate`, { method: 'POST' }, orgAdmin), 200);
 
 const resetResult = await expect('Password-reset request reports unavailable delivery honestly', () => request('/api/auth/password-reset/request', { method: 'POST', body: JSON.stringify({ email: state.users.customer.email }) }), [202, 503]);
 if (resetResult?.response.status === 503) record('Password reset requires external Resend configuration', true, 'Correctly reported missing email delivery configuration.');
