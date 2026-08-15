@@ -12,5 +12,12 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     sourcemap: true,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          mui: ['@mui/material', '@mui/icons-material'],
+        },
+      },
+    },
   },
 });
